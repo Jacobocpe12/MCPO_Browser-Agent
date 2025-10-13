@@ -64,7 +64,7 @@ services:
       - ./mcpo:/config
     entrypoint: ["/bin/sh", "-c"]
     command: >
-      mkdir -p /config &&
+      mkdir config &&
       [ -f /config/config.json ] ||
       echo '{
         "mcpServers": {
