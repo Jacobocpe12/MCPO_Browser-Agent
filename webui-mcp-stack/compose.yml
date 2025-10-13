@@ -45,15 +45,15 @@ services:
     restart: unless-stopped
 
   mcpo:
-    build:
-      context: ./mcpo
+    image: ghcr.io/open-webui/mcpo:latest
     container_name: mcpo
     depends_on:
       - playwright-mcp
       - ui-tars-mcp
     volumes:
-      - ./mcpo/config.json:/config/config.json:ro
-      - ./exports:/app/public
+      - ./mcpo:/config:ro
+    command: >-
+      mcpo --config /config/config.json --host 0.0.0.0 --port 3879 --server-type streamable-http
     ports:
       - "3880:3879"
     networks:
