@@ -44,7 +44,7 @@ services:
       - mcpnet
     restart: unless-stopped
 
-  mcpo:
+    mcpo:
     build:
       context: ./mcpo
     image: mcpo-browser-agent:latest
@@ -55,9 +55,10 @@ services:
     volumes:
       - ./mcpo:/config
     entrypoint: ["/bin/sh", "-c"]
-    command: |
+    command: >
       if [ ! -f /config/config.json ]; then
-        mkdir -p /config && echo '{
+        mkdir -p /config &&
+        echo '{
           "mcpServers": {
             "mcp_playwright": {
               "type": "streamable-http",
@@ -68,9 +69,9 @@ services:
               "url": "http://ui-tars-mcp:8000/mcp"
             }
           }
-        }' > /config/config.json
-      fi
-      echo "✅ Config ready at /config/config.json"
+        }' > /config/config.json;
+      fi;
+      echo "✅ Config ready at /config/config.json";
       exec mcpo --config /config/config.json --host 0.0.0.0 --port 3879
     ports:
       - "3880:3879"
