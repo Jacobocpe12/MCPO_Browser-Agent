@@ -53,7 +53,8 @@ services:
       - playwright-mcp
       - ui-tars-mcp
     volumes:
-      - ./mcpo:/config
+      - ./mcpo:/config:ro
+    command: ["mcpo", "--config", "/config/config.json", "--host", "0.0.0.0", "--port", "3879"]
     ports:
       - "3880:3879"
     networks:

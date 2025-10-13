@@ -55,15 +55,13 @@ The MCPO container now runs in **config-only** mode so it can attach to the alre
 }
 ```
 
-When `docker compose up` runs, the MCPO container executes the bundled launcher script, which ensures `/config/config.json` exists (copying a default if needed) before starting MCPO in config-only mode:
+When `docker compose up` runs, the MCPO container executes:
 
 ```bash
 mcpo --config /config/config.json --host 0.0.0.0 --port 3879
 ```
 
 This avoids the `TypeError: 'NoneType' object is not subscriptable` crash that occurred when mixing `--server-type` CLI arguments with the JSON configuration.
-
-> **Tip:** if you edit `mcpo/config.json`, rerun `docker compose up --build` so the patched image picks up the change. The runtime launcher only writes the default file when no config is present inside the mounted volume.
 
 ## Networking and proxy readiness
 
