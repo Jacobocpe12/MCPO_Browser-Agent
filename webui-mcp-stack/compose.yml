@@ -59,7 +59,7 @@ services:
       - "3880:3879"
     networks:
       - mcpnet
-    restart: unless-stopped
+    restart: no
 
   screenshot-viewer:
     image: nginx:alpine
