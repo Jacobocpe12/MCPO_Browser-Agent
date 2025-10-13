@@ -64,3 +64,4 @@ INFO - Uvicorn running on http://0.0.0.0:3879
 * Ensure the `type` key in JSON uses `streamable-http`.
 * Remove redundant `--server-type` flags from all docker-compose and CLI invocations.
 * Add health-check logic if needed before starting MCPO.
+* The Docker stack now builds a patched MCPO image whose launcher copies a default config into `/config/config.json` if the bind mount is empty, eliminating `FileNotFoundError` startup crashes.

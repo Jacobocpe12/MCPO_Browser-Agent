@@ -45,7 +45,9 @@ services:
     restart: unless-stopped
 
   mcpo:
-    image: ghcr.io/open-webui/mcpo:latest
+    build:
+      context: ./mcpo
+    image: mcpo-browser-agent:latest
     container_name: mcpo
     depends_on:
       - playwright-mcp

@@ -23,9 +23,9 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
    git clone <your-repo-url>
    cd webui-mcp-stack
    ```
-2. Start the stack:
+2. Start the stack (the first run builds the patched MCPO image):
    ```bash
-   docker compose up -d
+   docker compose up --build -d
    ```
 3. Connect OpenWebUI (or another MCP client) to the MCPO endpoint:
    ```
@@ -73,7 +73,12 @@ All services communicate over an internal Docker bridge network (`mcpnet`). Only
 webui-mcp-stack/
 ├── compose.yml
 ├── mcpo/
-│   └── config.json
+│   ├── config.json
+│   ├── launch_mcpo.py
+│   ├── patch_main.py
+│   ├── tools/
+│   │   └── public_file.py
+│   └── Dockerfile
 ├── exports/
 │   └── .gitkeep
 ├── .gitignore
