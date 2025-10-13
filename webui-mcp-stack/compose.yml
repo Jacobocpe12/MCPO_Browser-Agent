@@ -53,9 +53,7 @@ services:
     volumes:
       - ./mcpo:/config:ro
     command: >-
-      mcpo --host 0.0.0.0 --port 3879 --server-type streamable-http -- \
-      "http://playwright-mcp:8931/mcp" \
-      "http://ui-tars-mcp:8000/mcp"
+      
 
     ports:
       - "3880:3879"
