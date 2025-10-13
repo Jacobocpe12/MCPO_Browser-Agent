@@ -2,7 +2,6 @@ version: "3.9"
 
 networks:
   mcpnet:
-    external: true
     name: mcpnet
 
 services:
