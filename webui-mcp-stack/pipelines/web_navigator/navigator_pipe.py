@@ -17,7 +17,13 @@ from typing import Any, Dict, Iterable, Optional
 
 import httpx
 
-from open_webui.pipelines import Context, Event, Pipeline, Valve
+try:
+    # For integrated OpenWebUI runtime
+    from open_webui.pipelines import Context, Event, Pipeline, Valve
+except ImportError:
+    # For standalone pipelines container
+    from pipelines import Context, Event, Pipeline, Valve
+
 
 
 
