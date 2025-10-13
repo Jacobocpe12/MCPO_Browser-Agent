@@ -19,18 +19,6 @@ Example user message (JSON plan):
 }
 """
 
-import os
-import re
-import json
-import base64
-import httpx
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-
-try:
-    from open_webui.pipelines import Pipeline, Event, Context
-except ImportError:
-    from pipelines import Pipeline, Event, Context
 
 
 MCP_BASE   = "http://91.99.79.208:3880/mcp_playwright"
@@ -38,7 +26,15 @@ PUBLIC_URL = "http://91.99.79.208:3888"
 OUT_DIR    = "/tmp/playwright-output"
 
 
-class PlaywrightDirectStream(Pipeline):
+import time
+import base64
+import httpx
+from pprint import pformat
+from typing import List, Dict, Optional, Union, Generator, Iterator
+import os
+
+
+class Pipeline:
     def __init__(self):
         super().__init__(
             name="playwright_direct_stream",
