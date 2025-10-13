@@ -1,12 +1,12 @@
 {
   "mcpServers": {
-    "playwright": {
+    "mcp_playwright": {
       "type": "streamable-http",
       "url": "http://playwright-mcp:8931/mcp"
     },
-    "tars": {
-      "type": "sse",
-      "url": "http://ui-tars-mcp:8000/sse"
+    "mcp_tars": {
+      "type": "streamable-http",
+      "url": "http://ui-tars-mcp:8000/mcp"
     }
   }
 }

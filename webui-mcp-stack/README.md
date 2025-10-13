@@ -36,6 +36,33 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
    http://<host>:3888/<file>.png
    ```
 
+### How MCPO is configured
+
+The MCPO container now runs in **config-only** mode so it can attach to the already running Playwright and TARS MCP servers without extra CLI flags. The bundled [`mcpo/config.json`](./mcpo/config.json) uses the required hyphenated `streamable-http` type and advertises both endpoints:
+
+```json
+{
+  "mcpServers": {
+    "mcp_playwright": {
+      "type": "streamable-http",
+      "url": "http://playwright-mcp:8931/mcp"
+    },
+    "mcp_tars": {
+      "type": "streamable-http",
+      "url": "http://ui-tars-mcp:8000/mcp"
+    }
+  }
+}
+```
+
+When `docker compose up` runs, the MCPO container executes:
+
+```bash
+mcpo --config /config/config.json --host 0.0.0.0 --port 3879
+```
+
+This avoids the `TypeError: 'NoneType' object is not subscriptable` crash that occurred when mixing `--server-type` CLI arguments with the JSON configuration.
+
 ## Networking and proxy readiness
 
 All services communicate over an internal Docker bridge network (`mcpnet`). Only the MCPO hub and screenshot viewer expose ports on the host. This stack is proxy-ready (Traefik planned for `*.choype.com`) so it can be fronted by a reverse proxy without restructuring the containers.
