@@ -28,4 +28,5 @@ sys.argv = [
     "streamable-http",
 ]
 main()
+sleep 500
 PY
