@@ -9,27 +9,12 @@ services:
     image: mcr.microsoft.com/playwright/mcp:latest
     container_name: playwright-mcp
     shm_size: "2g"
-    command:
-      [
-        "node",
-        "cli.js",
-        "--headless",
-        "--browser",
-        "chromium",
-        "--no-sandbox",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8931",
-        "--user-data-dir",
-        "/pw-user-data",
-        "--isolated",
-        "--allowed-hosts",
-        "*",
-        "--allowed-origins",
-        "*",
-        "--caps=vision,pdf,install"
-      ]
+    entrypoint: ["node", "cli.js"]
+    command: ["--headless", "--browser", "chromium", "--no-sandbox",
+              "--host", "0.0.0.0", "--port", "8931",
+              "--user-data-dir", "/pw-user-data",
+              "--isolated", "--allowed-hosts", "*", "--allowed-origins", "*",
+              "--caps=vision,pdf,install"]
     volumes:
       - ./exports:/tmp/playwright-output
     networks:
@@ -66,7 +51,7 @@ services:
       - playwright-mcp
       - ui-tars-mcp
     volumes:
-      - ./mcpo/config.json:/config/config.json:ro
+      - ./mcpo:/config:ro
     command: >-
       mcpo --config /config/config.json --host 0.0.0.0 --port 3879 --server-type streamable-http
     ports:
