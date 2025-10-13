@@ -13,7 +13,7 @@ import json
 import base64
 import time
 from datetime import datetime
-from typing import List, Dict, Optional, Union, Generator, Iterator
+from typing import List, Dict, Optional, Union, Generator, Iterator, Tuple, Any
 
 import httpx
 
@@ -24,7 +24,7 @@ class Pipeline:
         self.description = (
             "Drive Playwright MCP directly via /browser_* endpoints and stream live status + screenshots."
         )
-        self.version = "2.1.0"
+        self.version = "2.2.0"
         self.author = "You"
 
         # Endpoints / paths
@@ -39,7 +39,6 @@ class Pipeline:
     # ---------------- Hooks ---------------- #
 
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
-        # You can inspect/adjust the request if you want
         return body
 
     # ---------------- Main loop ---------------- #
@@ -130,7 +129,6 @@ class Pipeline:
 
                     # ---------- SCREENSHOT ----------
                     elif op == "screenshot":
-                        # prefer saving to shared folder; fallback to base64
                         full = bool(act.get("fullPage", True))
                         filename = act.get("filename") or f"page-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.png"
                         if not filename.endswith(".png"):
@@ -138,43 +136,52 @@ class Pipeline:
                         save_path = filename if filename.startswith("/") else os.path.join(self.OUT_DIR, filename)
 
                         yield self._status(f"🛠️ [{idx}] Action: browser_take_screenshot → fullPage={full}, file={save_path}")
-                        r = http.post(f"{self.MCP_BASE}/browser_take_screenshot", json={"fullPage": full, "filename": save_path})
+                        r = http.post(
+                            f"{self.MCP_BASE}/browser_take_screenshot",
+                            json={"fullPage": full, "filename": save_path},
+                        )
 
-                        if self._ok(r) and os.path.exists(save_path):
-                            # send public URL + inline view
-                            public_url = f"{self.PUBLIC_BASE}/{os.path.basename(save_path)}"
-                            yield self._image_url(public_url)
-                            yield self._status(f"👀 [{idx}] Observation: saved to {public_url}")
-                        else:
-                            # try base64 from response
-                            b64 = ""
-                            try:
-                                data = r.json()
-                                b64 = data.get("data", "")
-                            except Exception:
-                                b64 = ""
-
-                            if not b64:
-                                # Explicit retry with base64 return
-                                r2 = http.post(f"{self.MCP_BASE}/browser_take_screenshot", json={"fullPage": full, "return": "base64"})
-                                if not self._ok(r2):
-                                    yield self._status(self._http_error(f"[{idx}] screenshot", r2), done=True)
-                                    return
-                                data2 = r2.json()
-                                b64 = data2.get("data", "")
-
-                            if b64:
-                                # normalize potential data URL
-                                if b64.startswith("data:image"):
-                                    try:
-                                        b64 = b64.split(",", 1)[1]
-                                    except Exception:
-                                        pass
-                                yield self._image_b64(b64)
-                                yield self._status(f"👀 [{idx}] Observation: inline screenshot ready")
+                        if self._ok(r):
+                            # 1) If we can see the file locally (shared volume), prefer public URL
+                            if os.path.exists(save_path):
+                                public_url = f"{self.PUBLIC_BASE}/{os.path.basename(save_path)}"
+                                yield self._image_url(public_url)
+                                yield self._status(f"👀 [{idx}] Observation: saved to {public_url}")
                             else:
-                                yield self._status(f"❌ [{idx}] Screenshot failed (no file, no base64)", done=True)
-                                return
+                                # 2) Try to parse JSON-ish and extract data/path
+                                obj, text = self._jsonish(r)
+                                b64 = self._coerce_b64(obj, text)
+                                remote_path = self._coerce_path(obj, text)
+
+                                if b64:
+                                    yield self._image_b64(b64)
+                                    yield self._status(f"👀 [{idx}] Observation: inline screenshot ready")
+                                elif remote_path:
+                                    # Publish via base name
+                                    public_url = f"{self.PUBLIC_BASE}/{os.path.basename(remote_path)}"
+                                    yield self._image_url(public_url)
+                                    yield self._status(f"👀 [{idx}] Observation: saved to {public_url}")
+                                else:
+                                    # 3) Final fallback: explicit base64 request
+                                    yield self._status(f"↩️ [{idx}] Retrying screenshot as base64")
+                                    r2 = http.post(
+                                        f"{self.MCP_BASE}/browser_take_screenshot",
+                                        json={"fullPage": full, "return": "base64"},
+                                    )
+                                    if not self._ok(r2):
+                                        yield self._status(self._http_error(f"[{idx}] screenshot(base64)", r2), done=True)
+                                        return
+                                    obj2, text2 = self._jsonish(r2)
+                                    b64_2 = self._coerce_b64(obj2, text2)
+                                    if b64_2:
+                                        yield self._image_b64(b64_2)
+                                        yield self._status(f"👀 [{idx}] Observation: inline screenshot ready")
+                                    else:
+                                        yield self._status(f"❌ [{idx}] Screenshot failed (no file, no base64)", done=True)
+                                        return
+                        else:
+                            yield self._status(self._http_error(f"[{idx}] screenshot", r), done=True)
+                            return
 
                     # ---------- UNKNOWN ----------
                     else:
@@ -239,6 +246,116 @@ class Pipeline:
             pass
         return f"{label}: HTTP {resp.status_code} {body}"
 
+    # --- tolerant response parsing ---
+
+    def _jsonish(self, resp: httpx.Response) -> Tuple[Optional[Any], str]:
+        """
+        Try to parse JSON; if not JSON, return (None, text).
+        If JSON is a string, return (that_string, that_string).
+        """
+        text = ""
+        try:
+            text = resp.text or ""
+        except Exception:
+            text = ""
+        try:
+            obj = resp.json()
+            # Some servers return a raw string as JSON
+            if isinstance(obj, str):
+                return obj, obj
+            return obj, text
+        except Exception:
+            return None, text
+
+    def _looks_like_b64(self, s: str) -> bool:
+        # Heuristic: long-ish, base64 charset
+        if not s or len(s) < 64:
+            return False
+        return re.fullmatch(r"[A-Za-z0-9+/=\s]+", s) is not None
+
+    def _coerce_b64(self, obj: Optional[Any], text: str) -> Optional[str]:
+        """
+        Try to extract a base64 image from various shapes:
+        - {"data": "..."} or {"base64": "..."} or {"image": {"base64": "..."}}
+        - list containing such dicts
+        - response body itself is a base64 string
+        - data: URL
+        """
+        # data-URL in text
+        if text.startswith("data:image"):
+            try:
+                return text.split(",", 1)[1]
+            except Exception:
+                pass
+
+        # body looks like base64
+        if self._looks_like_b64(text):
+            return text.replace("\n", "")
+
+        # dict shapes
+        if isinstance(obj, dict):
+            for key in ("data", "base64", "b64"):
+                v = obj.get(key)
+                if isinstance(v, str) and v:
+                    if v.startswith("data:image"):
+                        try:
+                            return v.split(",", 1)[1]
+                        except Exception:
+                            return v
+                    return v
+            image = obj.get("image")
+            if isinstance(image, dict):
+                v = image.get("base64") or image.get("data")
+                if isinstance(v, str) and v:
+                    if v.startswith("data:image"):
+                        try: return v.split(",", 1)[1]
+                        except Exception: return v
+                    return v
+
+        # list of dicts
+        if isinstance(obj, list):
+            for it in obj:
+                if isinstance(it, dict):
+                    b = self._coerce_b64(it, text="")
+                    if b:
+                        return b
+
+        # obj as raw string
+        if isinstance(obj, str) and self._looks_like_b64(obj):
+            return obj.replace("\n", "")
+
+        return None
+
+    def _coerce_path(self, obj: Optional[Any], text: str) -> Optional[str]:
+        """
+        Try to extract file path/filename from JSON-ish responses.
+        """
+        if isinstance(obj, dict):
+            for key in ("path", "file", "filename", "filepath"):
+                v = obj.get(key)
+                if isinstance(v, str) and v:
+                    return v
+            # nested "result"
+            res = obj.get("result")
+            if isinstance(res, dict):
+                for key in ("path", "file", "filename", "filepath"):
+                    v = res.get(key)
+                    if isinstance(v, str) and v:
+                        return v
+
+        if isinstance(obj, list):
+            for it in obj:
+                p = self._coerce_path(it, text="")
+                if p:
+                    return p
+
+        # crude guess in plain text
+        m = re.search(r"(/tmp/[^\s\"']+\.png)", text or "")
+        if m:
+            return m.group(1)
+
+        return None
+
     # event builders
     def _status(self, description: str, done: bool = False) -> Dict:
         return {"event": {"type": "status", "data": {"description": description, "done": done}}}
@@ -247,5 +364,4 @@ class Pipeline:
         return {"event": {"type": "image", "data": {"mime_type": "image/png", "base64": b64}}}
 
     def _image_url(self, url: str) -> Dict:
-        # OpenWebUI will render the image from a URL if provided under "path"
         return {"event": {"type": "image", "data": {"mime_type": "image/png", "path": url}}}
