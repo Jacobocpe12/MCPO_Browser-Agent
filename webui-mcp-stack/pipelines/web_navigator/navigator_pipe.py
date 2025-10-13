@@ -17,7 +17,8 @@ from typing import Any, Dict, Iterable, Optional
 
 import httpx
 
-from pipelines import Context, Event, Pipeline, Valve
+from open_webui.pipelines import Context, Event, Pipeline, Valve
+
 
 
 @dataclass
