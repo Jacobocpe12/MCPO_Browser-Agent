@@ -51,7 +51,7 @@ services:
     networks:
       - mcpnet
     restart: unless-stopped
-
+    
   mcpo:
     build:
       context: ./mcpo
@@ -63,23 +63,25 @@ services:
     volumes:
       - ./mcpo:/config
     entrypoint: ["/bin/sh", "-c"]
-    command: >
-      mkdir config &&
-      [ -f /config/config.json ] ||
-      echo '{
-        "mcpServers": {
-          "mcp_playwright": {
-            "type": "streamable-http",
-            "url": "http://playwright-mcp:8931/mcp"
-          },
-          "mcp_tars": {
-            "type": "streamable-http",
-            "url": "http://ui-tars-mcp:8000/mcp"
-          }
-        }
-      }' > /config/config.json &&
-      echo "✅ Config ready at /config/config.json" &&
-      exec mcpo --config /config/config.json --host 0.0.0.0 --port 3879
+    command:
+      - >
+        mkdir -p /config &&
+        if [ ! -f /config/config.json ]; then
+          echo '{
+            "mcpServers": {
+              "mcp_playwright": {
+                "type": "streamable-http",
+                "url": "http://playwright-mcp:8931/mcp"
+              },
+              "mcp_tars": {
+                "type": "streamable-http",
+                "url": "http://ui-tars-mcp:8000/mcp"
+              }
+            }
+          }' > /config/config.json;
+        fi &&
+        echo "✅ Config ready at /config/config.json" &&
+        exec mcpo --config /config/config.json --host 0.0.0.0 --port 3879
     ports:
       - "3880:3879"
     networks:
