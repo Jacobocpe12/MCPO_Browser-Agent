@@ -1,220 +1,214 @@
 """
-Playwright MCP — Direct, Streaming Navigator for OpenWebUI
+Playwright MCP — Direct streaming pipeline for OpenWebUI
 
-- Uses your proxied MCP at: http://91.99.79.208:3880/mcp_playwright
-- Emits real-time status *around actual HTTP calls* (no simulated delays)
-- Streams screenshots (inline base64) or via http://91.99.79.208:3888/<file>.png
-- Accepts either a simple URL in the prompt, or a JSON plan of actions
-
-Example user message (free-form):
-  "Go to https://geoportal.nrw and take a full-page screenshot."
-
-Example user message (JSON plan):
-{
-  "actions": [
-    {"op": "navigate",   "url": "https://geoportal.nrw"},
-    {"op": "wait_for",   "state": "load"},
-    {"op": "screenshot", "filename": "geoportal-home.png", "fullPage": true}
-  ]
-}
+- Uses proxied MCP at: http://91.99.79.208:3880/mcp_playwright
+- No /v1/run. Calls /browser_* endpoints directly.
+- Streams live status around real HTTP calls (no simulated sleeps).
+- Emits screenshots as inline base64 or public URL (http://91.99.79.208:3888/<file>.png).
 """
 
-
-
-MCP_BASE   = "http://91.99.79.208:3880/mcp_playwright"
-PUBLIC_URL = "http://91.99.79.208:3888"
-OUT_DIR    = "/tmp/playwright-output"
-
-
-import time
-import base64
-import httpx
-from pprint import pformat
-from typing import List, Dict, Optional, Union, Generator, Iterator
 import os
+import re
+import json
+import base64
+import time
+from datetime import datetime
+from typing import List, Dict, Optional, Union, Generator, Iterator
+
+import httpx
 
 
 class Pipeline:
     def __init__(self):
-        super().__init__(
-            name="playwright_direct_stream",
-            description="Drive Playwright MCP directly with real-time status and screenshots.",
-            version="2.0.0",
+        self.name = "Playwright Direct (Streaming)"
+        self.description = (
+            "Drive Playwright MCP directly via /browser_* endpoints and stream live status + screenshots."
         )
-        os.makedirs(OUT_DIR, exist_ok=True)
+        self.version = "2.1.0"
+        self.author = "You"
 
-    async def on_start(self, ctx: Context):
-        await ctx.emit(Event(type="status", data={"message": "✅ Playwright Direct Stream ready"}))
+        # Endpoints / paths
+        self.MCP_BASE = "http://91.99.79.208:3880/mcp_playwright"
+        self.PUBLIC_BASE = "http://91.99.79.208:3888"
+        self.OUT_DIR = "/tmp/playwright-output"
+        os.makedirs(self.OUT_DIR, exist_ok=True)
 
-    async def on_run(self, ctx: Context):
-        payload = ctx.data or {}
-        messages: List[Dict[str, Any]] = payload.get("messages", [])
+        # HTTP config
+        self.TIMEOUT = 90.0
 
-        # 1) Extract instruction
-        text = self._extract_text(messages)
-        if not text:
-            await ctx.emit(Event(type="status", data={"message": "❌ No instruction found"}))
+    # ---------------- Hooks ---------------- #
+
+    async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
+        # You can inspect/adjust the request if you want
+        return body
+
+    # ---------------- Main loop ---------------- #
+
+    def pipe(
+        self,
+        user_message: str,
+        model_id: str,
+        messages: List[dict],
+        body: dict,
+    ) -> Union[str, Generator, Iterator]:
+
+        prompt = self._extract_prompt(messages) or user_message or ""
+        if not prompt.strip():
+            yield self._status("❌ No navigation prompt provided.", done=True)
             return
 
-        # 2) Try parse JSON action plan; otherwise build a minimal plan from URL
-        plan = self._parse_plan(text)
-        if not plan:
-            url = self._extract_url(text)
+        yield self._status(f"🎯 Goal: {prompt}")
+
+        # Try JSON action plan; else fall back to simple URL + screenshot
+        actions = self._parse_actions(prompt)
+        if not actions:
+            url = self._extract_url(prompt)
             if not url:
-                await ctx.emit(Event(type="status", data={"message": "❌ No URL or valid plan provided"}))
+                yield self._status("❌ No URL found and no valid action plan provided.", done=True)
                 return
-            # default minimal plan: navigate + screenshot
-            plan = [
-                {"op": "navigate",   "url": url, "wait_until": "load"},
-                {"op": "screenshot", "fullPage": True}
+            actions = [
+                {"op": "navigate", "url": url, "wait_until": "load"},
+                {"op": "screenshot", "fullPage": True},
             ]
 
-        # 3) Execute each action, emitting live status around real HTTP calls
-        async with httpx.AsyncClient(timeout=90) as client:
-            for idx, action in enumerate(plan, start=1):
-                op = (action.get("op") or "").lower()
-                try:
+        try:
+            with httpx.Client(timeout=self.TIMEOUT) as http:
+                for idx, act in enumerate(actions, start=1):
+                    op = (act.get("op") or "").lower()
+
+                    # ---------- NAVIGATE ----------
                     if op == "navigate":
-                        url = action["url"]
-                        wait_until = action.get("wait_until", "load")
-                        await ctx.emit(Event(type="status", data={"message": f"🧭 [{idx}] Navigating: {url} (wait_until={wait_until})"}))
-                        r = await client.post(f"{MCP_BASE}/browser_navigate", json={"url": url, "wait_until": wait_until})
-                        await self._check_ok(ctx, r, f"[{idx}] navigate")
-                        await ctx.emit(Event(type="status", data={"message": f"✅ [{idx}] Page loaded"}))
+                        url = act["url"]
+                        wait_until = act.get("wait_until", "load")
+                        yield self._status(f"🛠️ [{idx}] Action: browser_navigate → {url} (wait_until={wait_until})")
+                        r = http.post(f"{self.MCP_BASE}/browser_navigate", json={"url": url, "wait_until": wait_until})
+                        if not self._ok(r):
+                            yield self._status(self._http_error(f"[{idx}] navigate", r), done=True)
+                            return
+                        yield self._status(f"👀 [{idx}] Observation: page loaded")
 
+                    # ---------- CLICK ----------
                     elif op == "click":
-                        selector = action["selector"]
-                        await ctx.emit(Event(type="status", data={"message": f"🖱️ [{idx}] Click: {selector}"}))
-                        r = await client.post(f"{MCP_BASE}/browser_click", json={"selector": selector})
-                        await self._check_ok(ctx, r, f"[{idx}] click")
-                        await ctx.emit(Event(type="status", data={"message": f"✅ [{idx}] Clicked {selector}"}))
+                        selector = act["selector"]
+                        yield self._status(f"🛠️ [{idx}] Action: browser_click → {selector}")
+                        r = http.post(f"{self.MCP_BASE}/browser_click", json={"selector": selector})
+                        if not self._ok(r):
+                            yield self._status(self._http_error(f"[{idx}] click", r), done=True)
+                            return
+                        yield self._status(f"👀 [{idx}] Observation: clicked {selector}")
 
+                    # ---------- TYPE ----------
                     elif op == "type":
-                        selector = action["selector"]
-                        textval  = action["text"]
-                        await ctx.emit(Event(type="status", data={"message": f"⌨️ [{idx}] Type into {selector}: {textval}"}))
-                        r = await client.post(f"{MCP_BASE}/browser_type", json={"selector": selector, "text": textval})
-                        await self._check_ok(ctx, r, f"[{idx}] type")
-                        await ctx.emit(Event(type="status", data={"message": f"✅ [{idx}] Typed"}))
+                        selector = act["selector"]
+                        textval = act["text"]
+                        yield self._status(f"🛠️ [{idx}] Action: browser_type → {selector} = {textval}")
+                        r = http.post(f"{self.MCP_BASE}/browser_type", json={"selector": selector, "text": textval})
+                        if not self._ok(r):
+                            yield self._status(self._http_error(f"[{idx}] type", r), done=True)
+                            return
+                        yield self._status(f"👀 [{idx}] Observation: typed into {selector}")
 
+                    # ---------- PRESS KEY ----------
                     elif op == "press_key":
-                        key = action["key"]
-                        await ctx.emit(Event(type="status", data={"message": f"⌨️ [{idx}] Press key: {key}"}))
-                        r = await client.post(f"{MCP_BASE}/browser_press_key", json={"key": key})
-                        await self._check_ok(ctx, r, f"[{idx}] press_key")
-                        await ctx.emit(Event(type="status", data={"message": f"✅ [{idx}] Key pressed"}))
+                        key = act["key"]
+                        yield self._status(f"🛠️ [{idx}] Action: browser_press_key → {key}")
+                        r = http.post(f"{self.MCP_BASE}/browser_press_key", json={"key": key})
+                        if not self._ok(r):
+                            yield self._status(self._http_error(f"[{idx}] press_key", r), done=True)
+                            return
+                        yield self._status(f"👀 [{idx}] Observation: key pressed {key}")
 
-                    elif op == "wait_for":
-                        # some servers provide a generic wait endpoint; otherwise use evaluate or wait_for state with navigate
-                        state = action.get("state", "networkidle")
-                        ms    = action.get("ms")
-                        await ctx.emit(Event(type="status", data={"message": f"⏳ [{idx}] Wait: state={state} ms={ms}"}))
-                        # Try /browser_wait_for (if available), else fall back to small evaluation wait
-                        endpoint = f"{MCP_BASE}/browser_wait_for"
-                        payload  = {}
-                        if ms is not None: payload["ms"] = ms
-                        if state:          payload["state"] = state
-                        r = await client.post(endpoint, json=payload)
-                        # If server returns 404 for wait_for, silently accept and continue
-                        if r.status_code == 404:
-                            await ctx.emit(Event(type="status", data={"message": f"ℹ️ [{idx}] /browser_wait_for not supported; continuing"}))
-                        else:
-                            await self._check_ok(ctx, r, f"[{idx}] wait_for")
-                        await ctx.emit(Event(type="status", data={"message": f"✅ [{idx}] Wait complete"}))
+                    # ---------- HOVER ----------
+                    elif op == "hover":
+                        selector = act["selector"]
+                        yield self._status(f"🛠️ [{idx}] Action: browser_hover → {selector}")
+                        r = http.post(f"{self.MCP_BASE}/browser_hover", json={"selector": selector})
+                        if not self._ok(r):
+                            yield self._status(self._http_error(f"[{idx}] hover", r), done=True)
+                            return
+                        yield self._status(f"👀 [{idx}] Observation: hovered {selector}")
 
+                    # ---------- SCREENSHOT ----------
                     elif op == "screenshot":
-                        full = bool(action.get("fullPage", True))
-                        filename = action.get("filename") or f"page-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.png"
-                        # ensure absolute path in shared dir
+                        # prefer saving to shared folder; fallback to base64
+                        full = bool(act.get("fullPage", True))
+                        filename = act.get("filename") or f"page-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.png"
                         if not filename.endswith(".png"):
                             filename += ".png"
-                        path = filename if filename.startswith("/") else os.path.join(OUT_DIR, filename)
+                        save_path = filename if filename.startswith("/") else os.path.join(self.OUT_DIR, filename)
 
-                        await ctx.emit(Event(type="status", data={"message": f"📸 [{idx}] Screenshot: fullPage={full}, file={path}"}))
-                        r = await client.post(f"{MCP_BASE}/browser_take_screenshot", json={"fullPage": full, "filename": path})
-                        # If success, try file first
-                        if r.status_code == 200 and os.path.exists(path):
-                            public = f"{PUBLIC_URL}/{os.path.basename(path)}"
-                            await self._emit_public_image(ctx, public)
-                            await ctx.emit(Event(type="status", data={"message": f"🖼️ [{idx}] Saved: {public}"}))
+                        yield self._status(f"🛠️ [{idx}] Action: browser_take_screenshot → fullPage={full}, file={save_path}")
+                        r = http.post(f"{self.MCP_BASE}/browser_take_screenshot", json={"fullPage": full, "filename": save_path})
+
+                        if self._ok(r) and os.path.exists(save_path):
+                            # send public URL + inline view
+                            public_url = f"{self.PUBLIC_BASE}/{os.path.basename(save_path)}"
+                            yield self._image_url(public_url)
+                            yield self._status(f"👀 [{idx}] Observation: saved to {public_url}")
                         else:
-                            # fallback: check JSON 'data' base64
+                            # try base64 from response
+                            b64 = ""
                             try:
                                 data = r.json()
+                                b64 = data.get("data", "")
                             except Exception:
-                                data = {}
-                            b64 = data.get("data")
-                            if b64:
-                                await self._emit_b64_image(ctx, b64)
-                                await ctx.emit(Event(type="status", data={"message": f"🖼️ [{idx}] Inline screenshot ready"}))
-                            else:
-                                # last resort: request base64 explicitly
-                                await ctx.emit(Event(type="status", data={"message": f"↩️ [{idx}] Retrying screenshot as base64"}))
-                                r2 = await client.post(f"{MCP_BASE}/browser_take_screenshot", json={"fullPage": full, "return": "base64"})
-                                r2.raise_for_status()
+                                b64 = ""
+
+                            if not b64:
+                                # Explicit retry with base64 return
+                                r2 = http.post(f"{self.MCP_BASE}/browser_take_screenshot", json={"fullPage": full, "return": "base64"})
+                                if not self._ok(r2):
+                                    yield self._status(self._http_error(f"[{idx}] screenshot", r2), done=True)
+                                    return
                                 data2 = r2.json()
-                                b64_2 = data2.get("data")
-                                if b64_2:
-                                    await self._emit_b64_image(ctx, b64_2)
-                                    await ctx.emit(Event(type="status", data={"message": f"🖼️ [{idx}] Inline screenshot ready"}))
-                                else:
-                                    await ctx.emit(Event(type="status", data={"message": f"❌ [{idx}] Screenshot failed (no data)"}))
+                                b64 = data2.get("data", "")
 
+                            if b64:
+                                # normalize potential data URL
+                                if b64.startswith("data:image"):
+                                    try:
+                                        b64 = b64.split(",", 1)[1]
+                                    except Exception:
+                                        pass
+                                yield self._image_b64(b64)
+                                yield self._status(f"👀 [{idx}] Observation: inline screenshot ready")
+                            else:
+                                yield self._status(f"❌ [{idx}] Screenshot failed (no file, no base64)", done=True)
+                                return
+
+                    # ---------- UNKNOWN ----------
                     else:
-                        await ctx.emit(Event(type="status", data={"message": f"ℹ️ [{idx}] Unknown op '{op}', skipping"}))
+                        yield self._status(f"ℹ️ [{idx}] Unknown op '{op}', skipping")
 
-                except httpx.HTTPError as http_err:
-                    await ctx.emit(Event(type="status", data={"message": f"❌ [{idx}] HTTP error: {http_err}"}))
-                except Exception as e:
-                    await ctx.emit(Event(type="status", data={"message": f"❌ [{idx}] Error: {e}"}))
+            yield self._status("✅ Finished", done=True)
 
-        await ctx.emit(Event(type="status", data={"message": "✅ Done"}))
+        except httpx.HTTPError as e:
+            yield self._status(f"❌ HTTP error: {e}", done=True)
+        except Exception as e:
+            yield self._status(f"❌ Error: {e}", done=True)
 
-    # ---- helpers ----
+    # ---------------- Helpers ---------------- #
 
-    async def _check_ok(self, ctx: Context, resp: httpx.Response, label: str):
-        if 200 <= resp.status_code < 300:
-            return
-        detail = ""
-        try:
-            detail = resp.text
-        except Exception:
-            pass
-        await ctx.emit(Event(type="status", data={"message": f"❌ {label}: HTTP {resp.status_code} {detail[:300]}"}))
-        resp.raise_for_status()
-
-    async def _emit_public_image(self, ctx: Context, public_url: str):
-        await ctx.emit(Event(type="image", data={"path": public_url, "mime_type": "image/png"}))
-
-    async def _emit_b64_image(self, ctx: Context, b64: str):
-        # Accept both raw b64 and data URLs
-        if b64.startswith("data:image"):
-            try:
-                b64 = b64.split(",", 1)[1]
-            except Exception:
-                pass
-        await ctx.emit(Event(type="image", data={"mime_type": "image/png", "base64": b64}))
-
-    def _extract_text(self, messages: List[Dict[str, Any]]) -> Optional[str]:
-        for msg in messages:
-            if msg.get("role") == "user":
-                content = msg.get("content")
-                if isinstance(content, list):
-                    texts = [c.get("text") for c in content if isinstance(c, dict) and c.get("type") == "text"]
-                    joined = "\n".join([t for t in texts if t])
-                    if joined:
-                        return joined
-                elif isinstance(content, str):
-                    return content
+    def _extract_prompt(self, messages: List[dict]) -> Optional[str]:
+        for m in messages:
+            if m.get("role") == "user":
+                c = m.get("content")
+                if isinstance(c, str):
+                    return c
+                if isinstance(c, list):
+                    texts = [b.get("text") for b in c if isinstance(b, dict) and b.get("type") == "text"]
+                    txt = "\n".join(t for t in texts if t)
+                    if txt:
+                        return txt
         return None
 
-    def _parse_plan(self, text: str) -> Optional[List[Dict[str, Any]]]:
+    def _parse_actions(self, text: str) -> Optional[List[Dict]]:
         text = text.strip()
         if not (text.startswith("{") or text.startswith("[")):
             return None
         try:
             obj = json.loads(text)
-            if isinstance(obj, dict) and "actions" in obj and isinstance(obj["actions"], list):
+            if isinstance(obj, dict) and isinstance(obj.get("actions"), list):
                 return obj["actions"]
             if isinstance(obj, list):
                 return obj
@@ -234,6 +228,24 @@ class Pipeline:
             return domain
         return None
 
+    def _ok(self, resp: httpx.Response) -> bool:
+        return 200 <= resp.status_code < 300
 
-def pipeline() -> Pipeline:
-    return PlaywrightDirectStream()
+    def _http_error(self, label: str, resp: httpx.Response) -> str:
+        body = ""
+        try:
+            body = resp.text[:400]
+        except Exception:
+            pass
+        return f"{label}: HTTP {resp.status_code} {body}"
+
+    # event builders
+    def _status(self, description: str, done: bool = False) -> Dict:
+        return {"event": {"type": "status", "data": {"description": description, "done": done}}}
+
+    def _image_b64(self, b64: str) -> Dict:
+        return {"event": {"type": "image", "data": {"mime_type": "image/png", "base64": b64}}}
+
+    def _image_url(self, url: str) -> Dict:
+        # OpenWebUI will render the image from a URL if provided under "path"
+        return {"event": {"type": "image", "data": {"mime_type": "image/png", "path": url}}}
