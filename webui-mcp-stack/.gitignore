@@ -1,0 +1,5 @@
+.env
+acme.json
+*.log
+exports/*
+!exports/.gitkeep
