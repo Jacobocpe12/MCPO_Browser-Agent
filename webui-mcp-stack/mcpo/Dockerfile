@@ -18,8 +18,6 @@ from mcpo.patch_main import patch_mcpo_app
 patch_mcpo_app(app)
 sys.argv = [
     "mcpo",
-    "--config",
-    "/config/config.json",
     "--host",
     "0.0.0.0",
     "--port",
