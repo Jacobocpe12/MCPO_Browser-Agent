@@ -5,99 +5,70 @@ networks:
     driver: bridge
 
 services:
-  # ────────────────
-  # 1️⃣  Playwright MCP
-  # ────────────────
-  playwright_mcp:
+  playwright-mcp:
     image: mcr.microsoft.com/playwright/mcp:latest
     container_name: playwright-mcp
     shm_size: "2g"
-    entrypoint: ["node","cli.js"]
-    command:
-      [
-        "--headless","--browser","chromium","--no-sandbox",
-        "--host","0.0.0.0","--port","8931",
-        "--user-data-dir","/pw-user-data",
-        "--isolated","--allowed-hosts","*","--allowed-origins","*",
-        "--caps=vision,pdf,install"
-      ]
+    entrypoint: ["node", "cli.js"]
+    command: ["--headless", "--browser", "chromium", "--no-sandbox",
+              "--host", "0.0.0.0", "--port", "8931",
+              "--user-data-dir", "/pw-user-data",
+              "--isolated", "--allowed-hosts", "*", "--allowed-origins", "*",
+              "--caps=vision,pdf,install"]
     volumes:
       - ./exports:/tmp/playwright-output
-    networks: [mcpnet]
+    networks:
+      - mcpnet
     restart: unless-stopped
 
-  # ────────────────
-  # 2️⃣  UI-TARS MCP
-  # ────────────────
-  ui_tars_mcp:
+  ui-tars-mcp:
     image: node:22-slim
     container_name: ui-tars-mcp
     shm_size: "1g"
     environment:
       - LANG=en_US.UTF-8
       - NODE_ENV=production
-    command: >
+    command: >-
       bash -c "
-      apt-get update &&
-      apt-get install -y wget gnupg ca-certificates fonts-liberation libxss1 dbus dbus-x11 &&
-      wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg &&
-      echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main' > /etc/apt/sources.list.d/google.list &&
-      apt-get update &&
-      apt-get install -y google-chrome-stable &&
-      npm install -g @agent-infra/mcp-server-browser@latest &&
-      mcp-server-browser --port 8000
+      set -euo pipefail;
+      apt-get update;
+      apt-get install -y wget gnupg ca-certificates fonts-liberation libxss1 dbus dbus-x11;
+      wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg;
+      echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main' > /etc/apt/sources.list.d/google.list;
+      apt-get update;
+      apt-get install -y google-chrome-stable;
+      npm install -g @agent-infra/mcp-server-browser@latest;
+      mcp-server-browser --port 8000;
       "
-    networks: [mcpnet]
+    networks:
+      - mcpnet
     restart: unless-stopped
 
-  # ────────────────
-  # 3️⃣  MCPO hub – Playwright only (uses config file)
-  # ────────────────
-  mcpo_playwright:
+  mcpo:
     image: ghcr.io/open-webui/mcpo:latest
-    container_name: mcpo-playwright
-    depends_on: [playwright_mcp]
+    container_name: mcpo
+    depends_on:
+      - playwright-mcp
+      - ui-tars-mcp
     volumes:
-      - ./mcpo/playwright.json:/config/config.json:ro
-    command: >
-      mcpo --config /config/config.json
-           --host 0.0.0.0
-           --port 3879
-           --server-type streamable-http
+      - ./mcpo:/config:ro
+    command: >-
+      mcpo --config /config/config.json --host 0.0.0.0 --port 3879 --server-type streamable-http
     ports:
       - "3880:3879"
-    networks: [mcpnet]
+    networks:
+      - mcpnet
     restart: unless-stopped
 
-  # ────────────────
-  # 4️⃣  MCPO hub – TARS only (uses config file)
-  # ────────────────
-  mcpo_tars:
-    image: ghcr.io/open-webui/mcpo:latest
-    container_name: mcpo-tars
-    depends_on: [ui_tars_mcp]
-    volumes:
-      - ./mcpo/tars.json:/config/config.json:ro
-    command: >
-      mcpo --config /config/config.json
-           --host 0.0.0.0
-           --port 3879
-           --server-type streamable-http
-    ports:
-      - "3881:3879"
-    networks: [mcpnet]
-    restart: unless-stopped
-
-  # ────────────────
-  # 5️⃣  Screenshot viewer
-  # ────────────────
-  shots:
+  screenshot-viewer:
     image: nginx:alpine
-    container_name: shots
-    depends_on: [playwright_mcp]
+    container_name: screenshot-viewer
+    depends_on:
+      - playwright-mcp
     volumes:
       - ./exports:/usr/share/nginx/html:ro
     ports:
       - "3888:80"
-    networks: [mcpnet]
+    networks:
+      - mcpnet
     restart: unless-stopped
