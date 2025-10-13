@@ -1,17 +1,15 @@
 """
 Playwright MCP — Direct streaming pipeline for OpenWebUI
 
-- Uses proxied MCP at: http://91.99.79.208:3880/mcp_playwright
-- No /v1/run. Calls /browser_* endpoints directly.
-- Streams live status around real HTTP calls (no simulated sleeps).
-- Emits screenshots as inline base64 or public URL (http://91.99.79.208:3888/<file>.png).
+- Talks directly to: http://91.99.79.208:3880/mcp_playwright
+- Streams real-time status around real HTTP calls (no fake delays)
+- Emits screenshots as inline base64 or via http://91.99.79.208:3888/<file>.png
 """
 
 import os
 import re
 import json
 import base64
-import time
 from datetime import datetime
 from typing import List, Dict, Optional, Union, Generator, Iterator, Tuple, Any
 
@@ -22,9 +20,9 @@ class Pipeline:
     def __init__(self):
         self.name = "Playwright Direct (Streaming)"
         self.description = (
-            "Drive Playwright MCP directly via /browser_* endpoints and stream live status + screenshots."
+            "Drive Playwright MCP via /browser_* endpoints and stream live status + screenshots."
         )
-        self.version = "2.2.0"
+        self.version = "2.3.0"
         self.author = "You"
 
         # Endpoints / paths
@@ -58,7 +56,6 @@ class Pipeline:
 
         yield self._status(f"🎯 Goal: {prompt}")
 
-        # Try JSON action plan; else fall back to simple URL + screenshot
         actions = self._parse_actions(prompt)
         if not actions:
             url = self._extract_url(prompt)
@@ -72,12 +69,23 @@ class Pipeline:
 
         try:
             with httpx.Client(timeout=self.TIMEOUT) as http:
+                # Ensure actions is a list of dicts
+                if not isinstance(actions, list):
+                    actions = [actions] if isinstance(actions, dict) else []
+
                 for idx, act in enumerate(actions, start=1):
+                    if not isinstance(act, dict):
+                        yield self._status(f"ℹ️ [{idx}] Skipping non-dict action: {act!r}")
+                        continue
+
                     op = (act.get("op") or "").lower()
 
                     # ---------- NAVIGATE ----------
                     if op == "navigate":
-                        url = act["url"]
+                        url = act.get("url")
+                        if not isinstance(url, str) or not url:
+                            yield self._status(f"❌ [{idx}] navigate: missing 'url'", done=True)
+                            return
                         wait_until = act.get("wait_until", "load")
                         yield self._status(f"🛠️ [{idx}] Action: browser_navigate → {url} (wait_until={wait_until})")
                         r = http.post(f"{self.MCP_BASE}/browser_navigate", json={"url": url, "wait_until": wait_until})
@@ -88,7 +96,10 @@ class Pipeline:
 
                     # ---------- CLICK ----------
                     elif op == "click":
-                        selector = act["selector"]
+                        selector = act.get("selector")
+                        if not isinstance(selector, str) or not selector:
+                            yield self._status(f"❌ [{idx}] click: missing 'selector'", done=True)
+                            return
                         yield self._status(f"🛠️ [{idx}] Action: browser_click → {selector}")
                         r = http.post(f"{self.MCP_BASE}/browser_click", json={"selector": selector})
                         if not self._ok(r):
@@ -98,8 +109,11 @@ class Pipeline:
 
                     # ---------- TYPE ----------
                     elif op == "type":
-                        selector = act["selector"]
-                        textval = act["text"]
+                        selector = act.get("selector")
+                        textval = act.get("text")
+                        if not isinstance(selector, str) or not isinstance(textval, str):
+                            yield self._status(f"❌ [{idx}] type: need 'selector' and 'text'", done=True)
+                            return
                         yield self._status(f"🛠️ [{idx}] Action: browser_type → {selector} = {textval}")
                         r = http.post(f"{self.MCP_BASE}/browser_type", json={"selector": selector, "text": textval})
                         if not self._ok(r):
@@ -109,7 +123,10 @@ class Pipeline:
 
                     # ---------- PRESS KEY ----------
                     elif op == "press_key":
-                        key = act["key"]
+                        key = act.get("key")
+                        if not isinstance(key, str) or not key:
+                            yield self._status(f"❌ [{idx}] press_key: missing 'key'", done=True)
+                            return
                         yield self._status(f"🛠️ [{idx}] Action: browser_press_key → {key}")
                         r = http.post(f"{self.MCP_BASE}/browser_press_key", json={"key": key})
                         if not self._ok(r):
@@ -119,7 +136,10 @@ class Pipeline:
 
                     # ---------- HOVER ----------
                     elif op == "hover":
-                        selector = act["selector"]
+                        selector = act.get("selector")
+                        if not isinstance(selector, str) or not selector:
+                            yield self._status(f"❌ [{idx}] hover: missing 'selector'", done=True)
+                            return
                         yield self._status(f"🛠️ [{idx}] Action: browser_hover → {selector}")
                         r = http.post(f"{self.MCP_BASE}/browser_hover", json={"selector": selector})
                         if not self._ok(r):
@@ -130,7 +150,9 @@ class Pipeline:
                     # ---------- SCREENSHOT ----------
                     elif op == "screenshot":
                         full = bool(act.get("fullPage", True))
-                        filename = act.get("filename") or f"page-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.png"
+                        filename = act.get("filename")
+                        if not isinstance(filename, str) or not filename:
+                            filename = f"page-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.png"
                         if not filename.endswith(".png"):
                             filename += ".png"
                         save_path = filename if filename.startswith("/") else os.path.join(self.OUT_DIR, filename)
@@ -142,13 +164,13 @@ class Pipeline:
                         )
 
                         if self._ok(r):
-                            # 1) If we can see the file locally (shared volume), prefer public URL
+                            # Prefer local file (shared volume)
                             if os.path.exists(save_path):
                                 public_url = f"{self.PUBLIC_BASE}/{os.path.basename(save_path)}"
                                 yield self._image_url(public_url)
                                 yield self._status(f"👀 [{idx}] Observation: saved to {public_url}")
                             else:
-                                # 2) Try to parse JSON-ish and extract data/path
+                                # Parse tolerant response (dict|list|string|non-JSON)
                                 obj, text = self._jsonish(r)
                                 b64 = self._coerce_b64(obj, text)
                                 remote_path = self._coerce_path(obj, text)
@@ -157,12 +179,11 @@ class Pipeline:
                                     yield self._image_b64(b64)
                                     yield self._status(f"👀 [{idx}] Observation: inline screenshot ready")
                                 elif remote_path:
-                                    # Publish via base name
                                     public_url = f"{self.PUBLIC_BASE}/{os.path.basename(remote_path)}"
                                     yield self._image_url(public_url)
                                     yield self._status(f"👀 [{idx}] Observation: saved to {public_url}")
                                 else:
-                                    # 3) Final fallback: explicit base64 request
+                                    # Final fallback: explicit base64 request
                                     yield self._status(f"↩️ [{idx}] Retrying screenshot as base64")
                                     r2 = http.post(
                                         f"{self.MCP_BASE}/browser_take_screenshot",
@@ -198,7 +219,7 @@ class Pipeline:
 
     def _extract_prompt(self, messages: List[dict]) -> Optional[str]:
         for m in messages:
-            if m.get("role") == "user":
+            if isinstance(m, dict) and m.get("role") == "user":
                 c = m.get("content")
                 if isinstance(c, str):
                     return c
@@ -249,47 +270,33 @@ class Pipeline:
     # --- tolerant response parsing ---
 
     def _jsonish(self, resp: httpx.Response) -> Tuple[Optional[Any], str]:
-        """
-        Try to parse JSON; if not JSON, return (None, text).
-        If JSON is a string, return (that_string, that_string).
-        """
-        text = ""
+        """Return (obj_or_None, raw_text). Accepts dict|list|str JSON or non-JSON."""
+        raw = ""
         try:
-            text = resp.text or ""
+            raw = resp.text or ""
         except Exception:
-            text = ""
+            raw = ""
         try:
             obj = resp.json()
-            # Some servers return a raw string as JSON
-            if isinstance(obj, str):
-                return obj, obj
-            return obj, text
+            return obj, raw
         except Exception:
-            return None, text
+            return None, raw
 
     def _looks_like_b64(self, s: str) -> bool:
-        # Heuristic: long-ish, base64 charset
         if not s or len(s) < 64:
             return False
         return re.fullmatch(r"[A-Za-z0-9+/=\s]+", s) is not None
 
     def _coerce_b64(self, obj: Optional[Any], text: str) -> Optional[str]:
-        """
-        Try to extract a base64 image from various shapes:
-        - {"data": "..."} or {"base64": "..."} or {"image": {"base64": "..."}}
-        - list containing such dicts
-        - response body itself is a base64 string
-        - data: URL
-        """
-        # data-URL in text
-        if text.startswith("data:image"):
+        # data URL in text
+        if isinstance(text, str) and text.startswith("data:image"):
             try:
                 return text.split(",", 1)[1]
             except Exception:
-                pass
+                return text
 
         # body looks like base64
-        if self._looks_like_b64(text):
+        if isinstance(text, str) and self._looks_like_b64(text):
             return text.replace("\n", "")
 
         # dict shapes
@@ -308,34 +315,34 @@ class Pipeline:
                 v = image.get("base64") or image.get("data")
                 if isinstance(v, str) and v:
                     if v.startswith("data:image"):
-                        try: return v.split(",", 1)[1]
-                        except Exception: return v
+                        try:
+                            return v.split(",", 1)[1]
+                        except Exception:
+                            return v
                     return v
 
         # list of dicts
         if isinstance(obj, list):
             for it in obj:
                 if isinstance(it, dict):
-                    b = self._coerce_b64(it, text="")
+                    b = self._coerce_b64(it, "")
                     if b:
                         return b
+                elif isinstance(it, str) and self._looks_like_b64(it):
+                    return it.replace("\n", "")
 
-        # obj as raw string
+        # obj itself is str?
         if isinstance(obj, str) and self._looks_like_b64(obj):
             return obj.replace("\n", "")
 
         return None
 
     def _coerce_path(self, obj: Optional[Any], text: str) -> Optional[str]:
-        """
-        Try to extract file path/filename from JSON-ish responses.
-        """
         if isinstance(obj, dict):
             for key in ("path", "file", "filename", "filepath"):
                 v = obj.get(key)
                 if isinstance(v, str) and v:
                     return v
-            # nested "result"
             res = obj.get("result")
             if isinstance(res, dict):
                 for key in ("path", "file", "filename", "filepath"):
@@ -345,20 +352,26 @@ class Pipeline:
 
         if isinstance(obj, list):
             for it in obj:
-                p = self._coerce_path(it, text="")
-                if p:
-                    return p
+                if isinstance(it, dict):
+                    p = self._coerce_path(it, "")
+                    if p:
+                        return p
+                elif isinstance(it, str):
+                    m = re.search(r"(/tmp/[^\s\"']+\.png)", it)
+                    if m:
+                        return m.group(1)
 
-        # crude guess in plain text
-        m = re.search(r"(/tmp/[^\s\"']+\.png)", text or "")
-        if m:
-            return m.group(1)
+        if isinstance(text, str):
+            m = re.search(r"(/tmp/[^\s\"']+\.png)", text)
+            if m:
+                return m.group(1)
 
         return None
 
-    # event builders
+    # --- event builders ---
+
     def _status(self, description: str, done: bool = False) -> Dict:
-        return {"event": {"type": "status", "data": {"description": description, "done": done}}}
+        return {"event": {"type": "status", "data": {"description": str(description), "done": done}}}
 
     def _image_b64(self, b64: str) -> Dict:
         return {"event": {"type": "image", "data": {"mime_type": "image/png", "base64": b64}}}
