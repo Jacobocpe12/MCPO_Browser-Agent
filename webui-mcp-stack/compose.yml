@@ -52,14 +52,12 @@ services:
       - ui-tars-mcp
     volumes:
       - ./mcpo:/config:ro
-    command: ["sleep", "3600"]
-      
-
+    command: ["mcpo", "--config", "/config/config.json", "--host", "0.0.0.0", "--port", "3879"]
     ports:
       - "3880:3879"
     networks:
       - mcpnet
-    restart: no
+    restart: unless-stopped
 
   screenshot-viewer:
     image: nginx:alpine
