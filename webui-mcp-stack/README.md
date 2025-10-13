@@ -23,9 +23,9 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
    git clone <your-repo-url>
    cd webui-mcp-stack
    ```
-2. Start the stack:
+2. Start the stack (the first run builds the patched MCPO image):
    ```bash
-   docker compose up -d
+   docker compose up --build -d
    ```
 3. Connect OpenWebUI (or another MCP client) to the MCPO endpoint:
    ```
@@ -35,6 +35,35 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
    ```
    http://<host>:3888/<file>.png
    ```
+
+### How MCPO is configured
+
+The MCPO container now runs in **config-only** mode so it can attach to the already running Playwright and TARS MCP servers without extra CLI flags. The bundled [`mcpo/config.json`](./mcpo/config.json) uses the required hyphenated `streamable-http` type and advertises both endpoints:
+
+```json
+{
+  "mcpServers": {
+    "mcp_playwright": {
+      "type": "streamable-http",
+      "url": "http://playwright-mcp:8931/mcp"
+    },
+    "mcp_tars": {
+      "type": "streamable-http",
+      "url": "http://ui-tars-mcp:8000/mcp"
+    }
+  }
+}
+```
+
+When `docker compose up` runs, the MCPO container executes the bundled launcher script, which ensures `/config/config.json` exists (copying a default if needed) before starting MCPO in config-only mode:
+
+```bash
+mcpo --config /config/config.json --host 0.0.0.0 --port 3879
+```
+
+This avoids the `TypeError: 'NoneType' object is not subscriptable` crash that occurred when mixing `--server-type` CLI arguments with the JSON configuration.
+
+> **Tip:** if you edit `mcpo/config.json`, rerun `docker compose up --build` so the patched image picks up the change. The runtime launcher only writes the default file when no config is present inside the mounted volume.
 
 ## Networking and proxy readiness
 
@@ -46,7 +75,12 @@ All services communicate over an internal Docker bridge network (`mcpnet`). Only
 webui-mcp-stack/
 ├── compose.yml
 ├── mcpo/
-│   └── config.json
+│   ├── config.json
+│   ├── launch_mcpo.py
+│   ├── patch_main.py
+│   ├── tools/
+│   │   └── public_file.py
+│   └── Dockerfile
 ├── exports/
 │   └── .gitkeep
 ├── .gitignore

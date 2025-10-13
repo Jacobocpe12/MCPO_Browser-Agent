@@ -1,30 +1,13 @@
 FROM ghcr.io/open-webui/mcpo:latest
 
-# Copy the additional FastAPI tooling into the image.
+# Provide the default config and FastAPI patches used by the stack.
+COPY config.json /app/mcpo/default_config.json
 COPY tools/public_file.py /app/mcpo/tools/public_file.py
 COPY patch_main.py /app/mcpo/patch_main.py
+COPY launch_mcpo.py /app/mcpo/launch_mcpo.py
 
 # Base URL used when returning public links.
 ENV PUBLIC_URL_BASE=http://shots.choype.com/public
 
-# Patch the MCPO app before starting the default main entry point with the
-# expected runtime arguments.
-CMD python3 - <<'PY'
-import sys
-from mcpo.main import main
-from mcpo import app
-from mcpo.patch_main import patch_mcpo_app
-
-patch_mcpo_app(app)
-sys.argv = [
-    "mcpo",
-    "--host",
-    "0.0.0.0",
-    "--port",
-    "3879",
-    "--server-type",
-    "streamable-http",
-]
-main()
-sleep 500
-PY
+# Launch MCPO with the config-only startup path and patched app.
+CMD ["python3", "/app/mcpo/launch_mcpo.py"]

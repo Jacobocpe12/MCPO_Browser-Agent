@@ -45,21 +45,20 @@ services:
     restart: unless-stopped
 
   mcpo:
-    image: ghcr.io/open-webui/mcpo:latest
+    build:
+      context: ./mcpo
+    image: mcpo-browser-agent:latest
     container_name: mcpo
     depends_on:
       - playwright-mcp
       - ui-tars-mcp
     volumes:
-      - ./mcpo:/config:ro
-    command: ["sleep", "3600"]
-      
-
+      - ./mcpo:/config
     ports:
       - "3880:3879"
     networks:
       - mcpnet
-    restart: no
+    restart: unless-stopped
 
   screenshot-viewer:
     image: nginx:alpine
