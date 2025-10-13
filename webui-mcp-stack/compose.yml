@@ -2,7 +2,8 @@ version: "3.9"
 
 networks:
   mcpnet:
-    driver: bridge
+    external: true
+    name: mcpnet
 
 services:
   playwright-mcp:
@@ -92,6 +93,21 @@ services:
     restart: unless-stopped
 
 
+
+  pipelines:
+    image: ghcr.io/open-webui/pipelines:latest
+    container_name: pipelines
+    restart: unless-stopped
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=${OPENAI_API_BASE:-https://api.openai.com/v1}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+    volumes:
+      - ${PIPELINES_PATH:-./pipelines}:/app/pipelines
+    ports:
+      - "9099:9099"
+    networks:
+      - mcpnet
 
   screenshot-viewer:
     image: nginx:alpine
