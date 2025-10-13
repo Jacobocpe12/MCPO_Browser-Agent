@@ -53,7 +53,7 @@ services:
     volumes:
       - ./mcpo:/config:ro
     command: >-
-      mcpo --config /config/config.json --host 0.0.0.0 --port 3879 --server-type streamable-http
+      mcpo --host 0.0.0.0 --port 3879 --server-type streamable-http
     ports:
       - "3880:3879"
     networks:
