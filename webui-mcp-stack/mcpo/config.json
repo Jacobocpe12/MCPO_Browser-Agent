@@ -5,8 +5,8 @@
       "url": "http://playwright-mcp:8931/mcp"
     },
     "tars": {
-      "type": "streamable-http",
-      "url": "http://ui-tars-mcp:8000/mcp"
+      "type": "sse",
+      "url": "http://ui-tars-mcp:8000/sse"
     }
   }
 }
