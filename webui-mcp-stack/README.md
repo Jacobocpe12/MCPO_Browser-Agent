@@ -1,6 +1,7 @@
+
 # WebUI MCP Stack
 
-A Docker Compose stack that bundles two Model Context Protocol (MCP) servers with a single MCPO hub and a lightweight screenshot viewer. The configuration is designed for OpenWebUI and ready for future reverse-proxy integration.
+A Docker Compose stack that bundles two Model Context Protocol (MCP) servers with a single MCPO hub, the OpenWebUI Pipelines service, and a lightweight screenshot viewer. The configuration is designed for OpenWebUI and ready for future reverse-proxy integration.
 
 ## Stack components
 
@@ -9,12 +10,14 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
 | **Playwright MCP** | Provides browser automation with Playwright. Configured with vision, PDF, and install capabilities, and writes artifacts to the shared `exports/` folder. |
 | **UI-TARS MCP** | Node-based vision and interaction MCP server that leverages Google Chrome for UI automation. |
 | **MCPO Hub** | Aggregates the two MCP servers and exposes a single endpoint for OpenWebUI or other MCP-compatible clients. |
+| **OpenWebUI Pipelines** | Hosts custom pipelines—including `web_navigator`—and exposes them to OpenWebUI over HTTP. |
 | **Screenshot Viewer** | Serves files from the shared `exports/` directory via HTTP so captured images can be accessed in a browser. |
 
 ## Prerequisites
 
 * Docker
 * Docker Compose v2
+* A Docker network named `mcpnet` (create it once with `docker network create mcpnet`)
 
 ## Usage
 
@@ -23,15 +26,26 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
    git clone <your-repo-url>
    cd webui-mcp-stack
    ```
-2. Start the stack (the first run builds the patched MCPO image):
+2. (One time) clone the OpenWebUI Pipelines repository and sync the custom pipeline:
+   ```bash
+   git clone https://github.com/open-webui/pipelines.git ./pipelines-upstream
+   mkdir -p /data/pipelines
+   rsync -av ./pipelines-upstream/ /data/pipelines/
+   rsync -av ./pipelines/web_navigator/ /data/pipelines/pipelines/web_navigator/
+   ```
+   Alternatively set `PIPELINES_PATH` to point at any writable directory that already contains the upstream Pipelines project.
+3. Start the stack (the first run builds the patched MCPO image):
    ```bash
    docker compose up --build -d
    ```
-3. Connect OpenWebUI (or another MCP client) to the MCPO endpoint:
+4. Connect OpenWebUI (or another MCP client) to the MCPO endpoint:
    ```
    http://<host>:3880/mcp
    ```
-4. Access generated screenshots or other exports via the viewer:
+5. Register the pipeline endpoint in OpenWebUI **Settings → Pipelines**:
+   * Base URL: `http://pipelines:9099`
+   * Pipeline: `web_navigator`
+6. Access generated screenshots or other exports via the viewer:
    ```
    http://<host>:3888/<file>.png
    ```
@@ -63,9 +77,34 @@ mcpo --config /config/config.json --host 0.0.0.0 --port 3879
 
 This avoids the `TypeError: 'NoneType' object is not subscriptable` crash that occurred when mixing `--server-type` CLI arguments with the JSON configuration.
 
+### Adding the `web_navigator` pipeline
+
+The [`pipelines/web_navigator/navigator_pipe.py`](./pipelines/web_navigator/navigator_pipe.py) module defines a pipeline that forwards navigation instructions from OpenWebUI to MCPO while streaming log messages and screenshots back to the chat interface. To enable it:
+
+1. Ensure the Pipelines container is mounting a volume that contains the upstream OpenWebUI Pipelines project plus this repository's `web_navigator` directory. By default the compose file points to `${PIPELINES_PATH:-./pipelines}`, so either set `PIPELINES_PATH` before running `docker compose up` or copy the repositories into `./pipelines`.
+2. Start (or restart) the stack. The Pipelines container log should include `Loaded pipeline: web_navigator`.
+3. Issue pipeline commands from OpenWebUI chats using the `#pipeline=web_navigator` directive, for example:
+   ```
+   #pipeline=web_navigator
+   Navigate to https://geoportal.nrw and find flood hazard maps for Aachen.
+   ```
+
+The pipeline polls MCPO for status updates, streams log events, and publishes screenshots as base64 images so they render inline in OpenWebUI.
+
+### Environment variables
+
+The compose file honors the following environment variables:
+
+| Variable | Purpose | Default |
+| -------- | ------- | ------- |
+| `OPENAI_API_KEY` | API key for the vision-capable LLM used by the Pipelines server. | _None_ (must be set) |
+| `OPENAI_API_BASE` | Base URL for the LLM endpoint. | `https://api.openai.com/v1` |
+| `OPENAI_MODEL` | Model identifier passed to the Pipelines runtime. | `gpt-4o-mini` |
+| `PIPELINES_PATH` | Host directory mounted into `/app/pipelines` inside the Pipelines container. | `./pipelines` |
+
 ## Networking and proxy readiness
 
-All services communicate over an internal Docker bridge network (`mcpnet`). Only the MCPO hub and screenshot viewer expose ports on the host. This stack is proxy-ready (Traefik planned for `*.choype.com`) so it can be fronted by a reverse proxy without restructuring the containers.
+All services communicate over a shared Docker bridge network (`mcpnet`). Only the MCPO hub, Pipelines API, and screenshot viewer expose ports on the host. This stack is proxy-ready (Traefik planned for `*.choype.com`) so it can be fronted by a reverse proxy without restructuring the containers.
 
 ## Repository layout
 
@@ -79,6 +118,9 @@ webui-mcp-stack/
 │   ├── tools/
 │   │   └── public_file.py
 │   └── Dockerfile
+├── pipelines/
+│   └── web_navigator/
+│       └── navigator_pipe.py
 ├── exports/
 │   └── .gitkeep
 ├── .gitignore
@@ -96,4 +138,3 @@ webui-mcp-stack/
    git push -u origin main
    ```
 2. In Portainer, create a new stack and paste the contents of `compose.yml`, or point Portainer to the GitHub repository. Deploy the stack and monitor service logs from the Portainer UI.
-
