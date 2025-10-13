@@ -52,7 +52,7 @@ services:
       - ui-tars-mcp
     volumes:
       - ./mcpo:/config:ro
-    command: >-
+    command: ["sleep", "3600"]
       
 
     ports:
