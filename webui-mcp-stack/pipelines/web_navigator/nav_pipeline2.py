@@ -503,3 +503,73 @@ class Pipeline:
 
     def _image_event(self, b64img: str) -> Dict:
         return {"event": {"type": "image", "data": {"mime_type": "image/png", "base64": b64img}}}
+
+    # ----------------------------------------------------------
+    # Intent + goal helpers
+    def _infer_intent(self, message: Optional[str]) -> str:
+        """Heuristically detect whether a prompt is small-talk or navigation work."""
+
+        if not message:
+            return "tool"
+
+        text = message.strip().lower()
+        if not text:
+            return "tool"
+
+        if "http://" in text or "https://" in text:
+            return "tool"
+
+        nav_keywords = (
+            "navigate",
+            "open",
+            "search",
+            "browser",
+            "website",
+            "page",
+            "click",
+            "scroll",
+            "type",
+            "fill",
+            "visit",
+            "go to",
+        )
+        if any(kw in text for kw in nav_keywords):
+            return "tool"
+
+        chat_markers = ("hi", "hello", "hey", "thank", "thanks", "how are")
+        if any(text.startswith(marker) for marker in chat_markers):
+            return "chat"
+
+        if text.endswith("?") and not any(kw in text for kw in nav_keywords):
+            return "chat"
+
+        if len(text.split()) <= 6 and not any(kw in text for kw in nav_keywords):
+            return "chat"
+
+        return "tool"
+
+    def _rewrite_goal(self, goal: str) -> str:
+        """Normalize user instructions and append context from the active session."""
+
+        cleaned = (goal or "").strip()
+        if not cleaned:
+            return ""
+
+        # Collapse internal whitespace so the goal stays compact for the LLM call.
+        cleaned = re.sub(r"\s+", " ", cleaned)
+
+        session = getattr(self, "session", None)
+        context_bits: List[str] = []
+        if session:
+            last_error = getattr(session, "last_error", None)
+            if last_error:
+                context_bits.append(f"Previous error to avoid: {last_error}")
+
+            last_snapshot = getattr(session, "last_snapshot", None)
+            if last_snapshot:
+                context_bits.append("Continue from the current page state; avoid reloading unnecessarily.")
+
+        if context_bits:
+            cleaned = f"{cleaned}. " + " ".join(context_bits)
+
+        return cleaned
