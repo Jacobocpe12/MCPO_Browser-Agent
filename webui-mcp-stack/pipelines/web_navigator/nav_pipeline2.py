@@ -55,6 +55,38 @@ class Pipeline:
         self._step_log: List[str] = []
         self._last_snapshots: List[str] = []
 
+        # Map high-level ops → MCP endpoints (aliases resolved separately)
+        self._tool_endpoints = {
+            "click": "browser_click",
+            "type": "browser_type",
+            "navigate": "browser_navigate",
+            "scroll": "browser_scroll",
+            "hover": "browser_hover",
+            "evaluate": "browser_evaluate",
+            "close": "browser_close",
+            "resize": "browser_resize",
+            "snapshot": "browser_snapshot",
+            "take_screenshot": "browser_take_screenshot",
+            "drag": "browser_drag",
+            "select_option": "browser_select_option",
+            "mouse_move_xy": "browser_mouse_move_xy",
+            "mouse_click_xy": "browser_mouse_click_xy",
+            "handle_dialog": "browser_handle_dialog",
+            "network_requests": "browser_network_requests",
+            "console_messages": "browser_console_messages",
+            "press": "browser_press_key",
+            "file_upload": "browser_file_upload",
+            "fill_form": "browser_fill_form",
+        }
+
+        self._op_aliases = {
+            "screenshot": "take_screenshot",
+            "press_key": "press",
+            "mouse_move": "mouse_move_xy",
+            "mouse_click": "mouse_click_xy",
+            "take_snapshot": "snapshot",
+        }
+
     # ----------------------------------------------------------
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         # Pre-run hook (can modify body if needed)
@@ -129,7 +161,8 @@ class Pipeline:
 
                 start_url = self._extract_url(goal)
                 self._step_log.append(f"Navigate → {start_url}")
-                nav_res = self._call_mcp(http, "browser_navigate", {"url": start_url})
+                nav_payload = self._make_payload("navigate", {"url": start_url})
+                nav_res = self._call_mcp(http, "browser_navigate", nav_payload)
                 yield self._status(f"🛠️ navigate → {start_url}")
 
                 # First observation
@@ -295,7 +328,8 @@ class Pipeline:
     # MCP calls: generic + snapshot + screenshot + exec
     def _call_mcp(self, http, endpoint: str, payload: dict = None):
         try:
-            r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=payload or {})
+            body = self._sanitize_payload(payload or {})
+            r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=body)
             r.raise_for_status()
             data = r.json()
             return data.get("result") or data
@@ -318,95 +352,250 @@ class Pipeline:
     def _take_screenshot(self, http):
         try:
             filename = f"page-{time.strftime('%Y%m%dT%H%M%S')}.png"
+            screenshot_payload = self._make_payload("take_screenshot", {"fullPage": True})
             r = http.post(
-                f"{self.MCPO_BASE_URL}/browser_take_screenshot",
-                json={"fullPage": True, "type": "png", "filename": f"/tmp/playwright-output/{filename}"}
+                f"{self.MCPO_BASE_URL}/{self._tool_endpoints['take_screenshot']}",
+                json=self._sanitize_payload(screenshot_payload),
             )
             r.raise_for_status()
-            url = f"{self.SCREENSHOT_PUBLIC_BASE}/{filename}"
-            # Try to open local path to embed as base64 (if volume is shared)
+            result = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
+            if isinstance(result, dict):
+                b64 = result.get("result") or result.get("base64")
+                if b64:
+                    return b64, None
+                path = result.get("path")
+                if path and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("utf-8")
+                    return b64, None
+            elif isinstance(result, str):
+                return result, None
+            # Fallback: try to load from shared directory if Playwright saved the file.
             local_path = os.path.join(self.LOCAL_IMG_DIR, filename)
             if os.path.exists(local_path):
                 with open(local_path, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode("utf-8")
-                return b64, url
-            # If not accessible locally, still return URL
-            return None, url
+                return b64, None
+            return None, None
         except Exception as e:
             return None, f"[screenshot error: {e}]"
 
     def _exec_op(self, http, op: str, args: Dict) -> (bool, str):
         """Execute Playwright MCP operation with schema-correct payloads."""
         try:
-            payload = None
-            endpoint = None
-
-            if op == "click":
-                endpoint = "browser_click"
-                # ✅ FIX: The API expects 'element' key for both ref and selector.
-                if args.get("ref"):
-                    payload = {"element": {"ref": args["ref"]}}
-                elif args.get("selector"):
-                    payload = {"element": args["selector"]}
-                else:
-                    return False, "click requires 'ref' or 'selector'"
-
-            elif op == "type":
-                endpoint = "browser_type"
-                # ✅ FIX: The API expects 'element' key for both ref and selector.
-                text_to_type = args.get("text", "")
-                if args.get("ref"):
-                    payload = {"element": {"ref": args["ref"]}, "text": text_to_type}
-                elif args.get("selector"):
-                    payload = {"element": args["selector"], "text": text_to_type}
-                else:
-                    return False, "type requires 'ref' or 'selector'"
-
-            elif op == "fill_form":
-                endpoint = "browser_fill_form"
-                payload = args
-
-            elif op == "press":
-                endpoint = "browser_press_key"
-                payload = {"key": args.get("key", "Enter")}
-
-            elif op == "hover":
-                endpoint = "browser_hover"
-                # ✅ FIX: The API expects 'element' key for both ref and selector.
-                if args.get("ref"):
-                    payload = {"element": {"ref": args["ref"]}}
-                elif args.get("selector"):
-                    payload = {"element": args["selector"]}
-                else:
-                    return False, "hover requires 'ref' or 'selector'"
-
-            elif op == "wait":
+            canonical = self._op_aliases.get(op, op)
+            if canonical == "wait":
                 ms = int(args.get("ms", 1000))
                 time.sleep(ms / 1000.0)
                 return True, f"waited {ms}ms"
 
-            elif op == "navigate":
-                endpoint = "browser_navigate"
-                payload = {"url": args.get("url")}
-            
-            else:
+            endpoint = self._tool_endpoints.get(canonical)
+            if not endpoint:
                 return False, f"unknown op: {op}"
-            
-            # Centralized request sending
-            if endpoint and payload is not None:
-                r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=payload)
-                if r.status_code >= 400:
-                    msg = r.text[:250]
-                    # Provide a clearer hint for 422 errors
-                    if r.status_code == 422:
-                        msg += " (Hint: The request body may not match the API's expected schema.)"
-                    return False, f"{op}: HTTP {r.status_code} - {msg}"
-                return True, r.text[:200]
-            
-            return False, f"Could not execute op: {op}"
 
+            payload = self._make_payload(canonical, args)
+            body = self._sanitize_payload(payload)
+
+            r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=body)
+            if r.status_code >= 400:
+                msg = r.text[:250]
+                if r.status_code == 422:
+                    msg += " (Hint: The request body may not match the API's expected schema.)"
+                return False, f"{op}: HTTP {r.status_code} - {msg}"
+            return True, r.text[:200]
+
+        except ValueError as e:
+            return False, str(e)
         except Exception as e:
             return False, f"{op} execution error: {e}"
+
+
+    def _make_payload(self, op: str, args: Optional[Dict]) -> Dict:
+        """Map high-level actions to the Playwright MCP request schema."""
+        args = args or {}
+        op = self._op_aliases.get(op, op)
+
+        if op in {"click", "hover"}:
+            ref = args.get("ref")
+            selector = args.get("selector")
+            if ref:
+                body: Dict[str, Union[str, bool]] = {"ref": ref}
+            elif selector:
+                body = {"selector": selector}
+            else:
+                raise ValueError(f"{op} requires 'ref' or 'selector'")
+            if op == "click":
+                if "doubleClick" in args:
+                    body["doubleClick"] = bool(args["doubleClick"])
+                if "button" in args:
+                    body["button"] = str(args["button"])
+            return body
+
+        if op == "type":
+            text = args.get("text")
+            ref = args.get("ref")
+            selector = args.get("selector")
+            if not text:
+                raise ValueError("type requires 'text'")
+            body: Dict[str, Union[str, bool]] = {"text": text}
+            if ref:
+                body["ref"] = ref
+            elif selector:
+                body["selector"] = selector
+            else:
+                raise ValueError("type requires 'ref' or 'selector'")
+            if "submit" in args:
+                body["submit"] = bool(args["submit"])
+            return body
+
+        if op == "press":
+            key = args.get("key") or args.get("keys")
+            if not key:
+                raise ValueError("press requires 'key'")
+            body: Dict[str, Union[str, bool]] = {"key": str(key)}
+            if args.get("ref"):
+                body["ref"] = args["ref"]
+            elif args.get("selector"):
+                body["selector"] = args["selector"]
+            return body
+
+        if op == "navigate":
+            url = args.get("url")
+            if not url:
+                raise ValueError("navigate requires 'url'")
+            return {"url": url}
+
+        if op == "take_screenshot":
+            body: Dict[str, bool] = {}
+            if "fullPage" in args:
+                body["fullPage"] = bool(args["fullPage"])
+            return body
+
+        if op == "scroll":
+            direction = args.get("direction")
+            if direction not in {"up", "down"}:
+                raise ValueError("scroll requires 'direction' of 'up' or 'down'")
+            body: Dict[str, Union[str, bool]] = {"direction": direction}
+            if args.get("ref"):
+                body["ref"] = args["ref"]
+            elif args.get("selector"):
+                body["selector"] = args["selector"]
+            return body
+
+        if op == "evaluate":
+            function = args.get("function")
+            if not function:
+                raise ValueError("evaluate requires 'function'")
+            body: Dict[str, str] = {"function": function}
+            if args.get("ref"):
+                body["ref"] = args["ref"]
+            if args.get("element"):
+                body["element"] = args["element"]
+            elif args.get("selector"):
+                body["element"] = args["selector"]
+            return body
+
+        if op == "close":
+            return {}
+
+        if op == "resize":
+            width = args.get("width")
+            height = args.get("height")
+            if width is None or height is None:
+                raise ValueError("resize requires 'width' and 'height'")
+            return {"width": int(width), "height": int(height)}
+
+        if op == "snapshot":
+            return {}
+
+        if op == "drag":
+            body: Dict[str, str] = {}
+            start_ref = args.get("startRef") or args.get("start_ref")
+            start_selector = args.get("startSelector") or args.get("start_selector")
+            end_ref = args.get("endRef") or args.get("end_ref")
+            end_selector = args.get("endSelector") or args.get("end_selector")
+            if start_ref:
+                body["startRef"] = start_ref
+            elif start_selector:
+                body["startSelector"] = start_selector
+            else:
+                raise ValueError("drag requires 'startRef' or 'startSelector'")
+            if end_ref:
+                body["endRef"] = end_ref
+            elif end_selector:
+                body["endSelector"] = end_selector
+            else:
+                raise ValueError("drag requires 'endRef' or 'endSelector'")
+            return body
+
+        if op == "select_option":
+            values = args.get("values") or args.get("value")
+            if isinstance(values, str):
+                values = [values]
+            if not values or not isinstance(values, (list, tuple)):
+                raise ValueError("select_option requires 'values' list")
+            body: Dict[str, Union[str, List[str]]] = {"values": list(values)}
+            if args.get("ref"):
+                body["ref"] = args["ref"]
+            elif args.get("selector"):
+                body["selector"] = args["selector"]
+            else:
+                raise ValueError("select_option requires 'ref' or 'selector'")
+            return body
+
+        if op == "mouse_move_xy":
+            x = args.get("x")
+            y = args.get("y")
+            if x is None or y is None:
+                raise ValueError("mouse_move requires 'x' and 'y'")
+            return {"x": float(x), "y": float(y)}
+
+        if op == "mouse_click_xy":
+            x = args.get("x")
+            y = args.get("y")
+            if x is None or y is None:
+                raise ValueError("mouse_click requires 'x' and 'y'")
+            body: Dict[str, Union[float, str]] = {"x": float(x), "y": float(y)}
+            if args.get("button"):
+                body["button"] = str(args["button"])
+            return body
+
+        if op == "handle_dialog":
+            if "accept" not in args:
+                raise ValueError("handle_dialog requires 'accept'")
+            return {"accept": bool(args["accept"])}
+
+        if op == "network_requests":
+            return {}
+
+        if op == "console_messages":
+            return {}
+
+        if op == "file_upload":
+            paths = args.get("paths") or args.get("path")
+            if isinstance(paths, str):
+                paths = [paths]
+            if not paths or not isinstance(paths, (list, tuple)):
+                raise ValueError("file_upload requires 'paths' list")
+            return {"paths": list(paths)}
+
+        if op == "fill_form":
+            fields = args.get("fields") if isinstance(args, dict) else args
+            if not isinstance(fields, list):
+                raise ValueError("fill_form requires 'fields' list")
+            return {"fields": fields}
+
+        raise ValueError(f"Unsupported payload request for op '{op}'")
+
+    def _sanitize_payload(self, body: Optional[Dict]) -> Dict:
+        body = dict(body or {})
+        if "element" in body and isinstance(body["element"], dict) and "ref" in body["element"]:
+            body["ref"] = body["element"]["ref"]
+            del body["element"]
+        elif "element" in body and isinstance(body["element"], str):
+            body["selector"] = body["element"]
+            del body["element"]
+        return body
 
 
     # ----------------------------------------------------------
@@ -421,8 +610,11 @@ class Pipeline:
             "You are a web navigation reasoning engine.\n"
             "You receive STRUCTURED SNAPSHOT (with [ref=e##]) and visible text.\n"
             "Choose ONE next action in JSON when possible.\n"
-            "Allowed ops: navigate(url), click(ref|selector), type(ref|selector,text), "
-            "press(key), hover(ref|selector), wait(ms), done(reason).\n"
+            "Allowed ops: navigate(url), click(ref|selector,doubleClick?,button?), type(ref|selector,text,submit?), "
+            "press(key,ref|selector?), hover(ref|selector), scroll(direction,ref?), wait(ms), "
+            "take_screenshot(fullPage?), snapshot(), evaluate(function,ref?|element?), drag(startRef/startSelector,endRef/endSelector), "
+            "select_option(ref|selector,values), mouse_move(x,y), mouse_click(x,y,button?), handle_dialog(accept), "
+            "file_upload(paths), fill_form(fields), resize(width,height), close(), network_requests(), console_messages(), done(reason).\n"
             "Return ONLY JSON when you can. If already done, use {\"op\":\"done\",\"reason\":\"...\"}."
         )
         messages = [
@@ -496,21 +688,66 @@ class Pipeline:
         return None
 
     def _pretty_action(self, op: str, a: Dict) -> str:
-        if op == "navigate":
+        canonical = self._op_aliases.get(op, op)
+        if canonical == "navigate":
             return f"navigate → {a.get('url','')}"
-        if op == "click":
+        if canonical == "click":
             target = a.get("ref") or a.get("selector") or "?"
-            return f"click → {target}"
-        if op == "type":
+            dbl = " (double)" if a.get("doubleClick") else ""
+            button = f" [{a.get('button')}]" if a.get("button") else ""
+            return f"click{dbl}{button} → {target}"
+        if canonical == "type":
             target = a.get("ref") or a.get("selector") or "?"
             text = a.get("text","")
-            return f"type → {target} = '{text}'"
-        if op == "press":
-            return f"press → {a.get('key','Enter')}"
-        if op == "hover":
+            submit = " (submit)" if a.get("submit") else ""
+            return f"type{submit} → {target} = '{text}'"
+        if canonical == "press":
+            target = a.get("ref") or a.get("selector")
+            scope = f" on {target}" if target else ""
+            return f"press → {a.get('key','Enter')}{scope}"
+        if canonical == "hover":
             target = a.get("ref") or a.get("selector") or "?"
             return f"hover → {target}"
-        if op == "wait":
+        if canonical == "scroll":
+            direction = a.get("direction", "?")
+            target = a.get("ref") or a.get("selector")
+            scope = f" around {target}" if target else ""
+            return f"scroll {direction}{scope}"
+        if canonical == "take_screenshot":
+            mode = " fullPage" if a.get("fullPage") else ""
+            return f"screenshot{mode}"
+        if canonical == "snapshot":
+            return "snapshot"
+        if canonical == "evaluate":
+            return "evaluate JS"
+        if canonical == "drag":
+            start = a.get("startRef") or a.get("startSelector") or "?"
+            end = a.get("endRef") or a.get("endSelector") or "?"
+            return f"drag {start} → {end}"
+        if canonical == "select_option":
+            target = a.get("ref") or a.get("selector") or "?"
+            values = ",".join(a.get("values", [])) if isinstance(a.get("values"), list) else a.get("values", "")
+            return f"select_option → {target} = [{values}]"
+        if canonical == "mouse_move_xy":
+            return f"mouse_move → ({a.get('x')},{a.get('y')})"
+        if canonical == "mouse_click_xy":
+            button = f" [{a.get('button')}]" if a.get("button") else ""
+            return f"mouse_click{button} → ({a.get('x')},{a.get('y')})"
+        if canonical == "handle_dialog":
+            return "handle_dialog → accept" if a.get("accept") else "handle_dialog → dismiss"
+        if canonical == "file_upload":
+            return f"file_upload → {len(a.get('paths', []))} file(s)"
+        if canonical == "fill_form":
+            return f"fill_form → {len(a.get('fields', []))} field(s)"
+        if canonical == "resize":
+            return f"resize → {a.get('width')}x{a.get('height')}"
+        if canonical == "close":
+            return "close browser"
+        if canonical == "network_requests":
+            return "fetch network requests"
+        if canonical == "console_messages":
+            return "fetch console messages"
+        if canonical == "wait":
             return f"wait → {a.get('ms',1000)}ms"
         return f"{op}"
 
