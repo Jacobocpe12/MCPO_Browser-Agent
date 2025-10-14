@@ -129,7 +129,8 @@ class Pipeline:
 
                 start_url = self._extract_url(goal)
                 self._step_log.append(f"Navigate → {start_url}")
-                nav_res = self._call_mcp(http, "browser_navigate", {"url": start_url})
+                nav_payload = self._make_payload("navigate", {"url": start_url})
+                nav_res = self._call_mcp(http, "browser_navigate", nav_payload)
                 yield self._status(f"🛠️ navigate → {start_url}")
 
                 # First observation
@@ -295,7 +296,8 @@ class Pipeline:
     # MCP calls: generic + snapshot + screenshot + exec
     def _call_mcp(self, http, endpoint: str, payload: dict = None):
         try:
-            r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=payload or {})
+            body = self._sanitize_payload(payload or {})
+            r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=body)
             r.raise_for_status()
             data = r.json()
             return data.get("result") or data
@@ -318,20 +320,31 @@ class Pipeline:
     def _take_screenshot(self, http):
         try:
             filename = f"page-{time.strftime('%Y%m%dT%H%M%S')}.png"
+            screenshot_payload = self._make_payload("screenshot", {"fullPage": True})
             r = http.post(
-                f"{self.MCPO_BASE_URL}/browser_take_screenshot",
-                json={"fullPage": True, "type": "png", "filename": f"/tmp/playwright-output/{filename}"}
+                f"{self.MCPO_BASE_URL}/browser_screenshot",
+                json=self._sanitize_payload(screenshot_payload),
             )
             r.raise_for_status()
-            url = f"{self.SCREENSHOT_PUBLIC_BASE}/{filename}"
-            # Try to open local path to embed as base64 (if volume is shared)
+            result = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
+            if isinstance(result, dict):
+                b64 = result.get("result") or result.get("base64")
+                if b64:
+                    return b64, None
+                path = result.get("path")
+                if path and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("utf-8")
+                    return b64, None
+            elif isinstance(result, str):
+                return result, None
+            # Fallback: try to load from shared directory if Playwright saved the file.
             local_path = os.path.join(self.LOCAL_IMG_DIR, filename)
             if os.path.exists(local_path):
                 with open(local_path, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode("utf-8")
-                return b64, url
-            # If not accessible locally, still return URL
-            return None, url
+                return b64, None
+            return None, None
         except Exception as e:
             return None, f"[screenshot error: {e}]"
 
@@ -343,24 +356,11 @@ class Pipeline:
 
             if op == "click":
                 endpoint = "browser_click"
-                # ✅ FIX: The API expects 'element' key for both ref and selector.
-                if args.get("ref"):
-                    payload = {"element": {"ref": args["ref"]}}
-                elif args.get("selector"):
-                    payload = {"element": args["selector"]}
-                else:
-                    return False, "click requires 'ref' or 'selector'"
+                payload = self._make_payload("click", args)
 
             elif op == "type":
                 endpoint = "browser_type"
-                # ✅ FIX: The API expects 'element' key for both ref and selector.
-                text_to_type = args.get("text", "")
-                if args.get("ref"):
-                    payload = {"element": {"ref": args["ref"]}, "text": text_to_type}
-                elif args.get("selector"):
-                    payload = {"element": args["selector"], "text": text_to_type}
-                else:
-                    return False, "type requires 'ref' or 'selector'"
+                payload = self._make_payload("type", args)
 
             elif op == "fill_form":
                 endpoint = "browser_fill_form"
@@ -372,13 +372,7 @@ class Pipeline:
 
             elif op == "hover":
                 endpoint = "browser_hover"
-                # ✅ FIX: The API expects 'element' key for both ref and selector.
-                if args.get("ref"):
-                    payload = {"element": {"ref": args["ref"]}}
-                elif args.get("selector"):
-                    payload = {"element": args["selector"]}
-                else:
-                    return False, "hover requires 'ref' or 'selector'"
+                payload = self._make_payload("hover", args)
 
             elif op == "wait":
                 ms = int(args.get("ms", 1000))
@@ -387,14 +381,19 @@ class Pipeline:
 
             elif op == "navigate":
                 endpoint = "browser_navigate"
-                payload = {"url": args.get("url")}
-            
+                payload = self._make_payload("navigate", args)
+
+            elif op == "scroll":
+                endpoint = "browser_scroll"
+                payload = self._make_payload("scroll", args)
+
             else:
                 return False, f"unknown op: {op}"
-            
+
             # Centralized request sending
             if endpoint and payload is not None:
-                r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=payload)
+                body = self._sanitize_payload(payload)
+                r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=body)
                 if r.status_code >= 400:
                     msg = r.text[:250]
                     # Provide a clearer hint for 422 errors
@@ -405,8 +404,74 @@ class Pipeline:
             
             return False, f"Could not execute op: {op}"
 
+        except ValueError as e:
+            return False, str(e)
         except Exception as e:
             return False, f"{op} execution error: {e}"
+
+
+    def _make_payload(self, op: str, args: Optional[Dict]) -> Dict:
+        """Map high-level actions to the Playwright MCP request schema."""
+        args = args or {}
+
+        if op in {"click", "hover"}:
+            ref = args.get("ref")
+            selector = args.get("selector")
+            if ref:
+                return {"ref": ref}
+            if selector:
+                return {"selector": selector}
+            raise ValueError(f"{op} requires 'ref' or 'selector'")
+
+        if op == "type":
+            text = args.get("text")
+            ref = args.get("ref")
+            selector = args.get("selector")
+            if not text:
+                raise ValueError("type requires 'text'")
+            body: Dict[str, Union[str, bool]] = {"text": text}
+            if ref:
+                body["ref"] = ref
+            elif selector:
+                body["selector"] = selector
+            else:
+                raise ValueError("type requires 'ref' or 'selector'")
+            if "submit" in args:
+                body["submit"] = bool(args["submit"])
+            return body
+
+        if op == "navigate":
+            url = args.get("url")
+            if not url:
+                raise ValueError("navigate requires 'url'")
+            return {"url": url}
+
+        if op == "screenshot":
+            body: Dict[str, bool] = {}
+            if "fullPage" in args:
+                body["fullPage"] = bool(args["fullPage"])
+            return body
+
+        if op == "scroll":
+            direction = args.get("direction")
+            if direction not in {"up", "down"}:
+                raise ValueError("scroll requires 'direction' of 'up' or 'down'")
+            body: Dict[str, Union[str, bool]] = {"direction": direction}
+            if args.get("ref"):
+                body["ref"] = args["ref"]
+            return body
+
+        raise ValueError(f"Unsupported payload request for op '{op}'")
+
+    def _sanitize_payload(self, body: Optional[Dict]) -> Dict:
+        body = dict(body or {})
+        if "element" in body and isinstance(body["element"], dict) and "ref" in body["element"]:
+            body["ref"] = body["element"]["ref"]
+            del body["element"]
+        elif "element" in body and isinstance(body["element"], str):
+            body["selector"] = body["element"]
+            del body["element"]
+        return body
 
 
     # ----------------------------------------------------------
