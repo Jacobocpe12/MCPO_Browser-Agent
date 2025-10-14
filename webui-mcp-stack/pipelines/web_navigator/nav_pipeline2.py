@@ -30,8 +30,8 @@ class Pipeline:
             "Combines structured snapshots and screenshots for reasoning, "
             "streams steps, and returns a final summary."
         )
-        self.version = "5.0.0"
-        self.author = "You + ChatGPT"
+        self.version = "5.1.0" # Version incremented for fix
+        self.author = "You + Gemini"
         self.debug = False
 
         # === Core endpoints (MCPO proxy) ===
@@ -205,7 +205,6 @@ class Pipeline:
         except Exception as e:
             if self.debug:
                 import traceback
-
                 traceback.print_exc()
             self.session.last_error = str(e)
             yield self._status(f"💥 Pipeline error: {e}", done=True)
@@ -226,28 +225,39 @@ class Pipeline:
         return None
 
     def _extract_url(self, text: str) -> str:
+        url = None
         # full URL present?
-        m = re.search(r"(https?://[^\s]+)", text)
+        m = re.search(r"(https?://[^\s\"']+)", text) # Avoid trailing quotes
         if m:
-            return m.group(1)
-
+            url = m.group(1)
+        
         # domain-like (example.de, example.com)
-        m = re.search(r"\b([\w-]+\.(com|org|net|edu|gov|info|io|ai|de|nl|fr|es|it|ch))\b", text, re.I)
-        if m:
-            return f"https://{m.group(1)}"
+        elif re.search(r"\b([\w-]+\.(com|org|net|edu|gov|info|io|ai|de|nl|fr|es|it|ch))\b", text, re.I):
+             m = re.search(r"\b([\w-]+\.(com|org|net|edu|gov|info|io|ai|de|nl|fr|es|it|ch))\b", text, re.I)
+             if m:
+                url = f"https://{m.group(1)}"
+        
+        # Fallback to search if no clear URL
+        else:
+            # Use a search engine for ambiguous queries
+            from urllib.parse import quote_plus
+            query = re.sub(r'[^a-zA-Z0-9\s-]', '', text).strip()
+            url = f"https://www.google.com/search?q={quote_plus(query)}"
 
-        # keyword fallback → www.<keyword>.com
-        tokens = re.findall(r"[a-zA-Z0-9\-]+", text)
-        if tokens:
-            return f"https://www.{tokens[0].lower()}.com"
+        # ✅ FIX: Final sanitization to remove common trailing punctuation.
+        if url:
+            return url.strip().rstrip('.,;:"\'')
+            
+        return "https://www.google.com" # Default fallback
 
-        return "https://example.com"
 
     def _build_observation(self, http, snapshot_text: Optional[str]) -> str:
         parts = []
         # Page URL + Title (lightweight query)
         try:
-            r = http.post(f"{self.MCPO_BASE_URL}/browser_evaluate", json={"script": "({url: location.href, title: document.title})"})
+            # ✅ FIX: The API expects the key "expression", not "script".
+            payload = {"expression": "({url: location.href, title: document.title})"}
+            r = http.post(f"{self.MCPO_BASE_URL}/browser_evaluate", json=payload)
             if r.status_code == 200:
                 data = r.json().get("result", {})
                 parts.append(f"URL: {data.get('url','?')}")
@@ -257,7 +267,9 @@ class Pipeline:
 
         # Visible text (truncated) for context
         try:
-            r = http.post(f"{self.MCPO_BASE_URL}/browser_evaluate", json={"script": "document.body.innerText.slice(0,4000)"})
+            # ✅ FIX: The API expects the key "expression", not "script".
+            payload = {"expression": "document.body.innerText.slice(0,4000)"}
+            r = http.post(f"{self.MCPO_BASE_URL}/browser_evaluate", json=payload)
             if r.status_code == 200:
                 txt = r.json().get("result", "") or ""
                 parts.append("VISIBLE_TEXT:")
@@ -317,7 +329,7 @@ class Pipeline:
             if os.path.exists(local_path):
                 with open(local_path, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode("utf-8")
-                    return b64, url
+                return b64, url
             # If not accessible locally, still return URL
             return None, url
         except Exception as e:
@@ -326,45 +338,47 @@ class Pipeline:
     def _exec_op(self, http, op: str, args: Dict) -> (bool, str):
         """Execute Playwright MCP operation with schema-correct payloads."""
         try:
+            payload = None
+            endpoint = None
+
             if op == "click":
-                # ✅ Fix: Always send 'element' object, not bare ref
-                if args.get("ref"):
-                    element = {"ref": args["ref"]}
-                    for k, v in args.items():
-                        if k not in ("op", "ref"):
-                            element[k] = v
-                    payload = {"element": element}
-                elif args.get("selector"):
-                    payload = {"selector": args.get("selector")}
-                else:
-                    return False, "click missing ref/selector"
-
-                r = http.post(f"{self.MCPO_BASE_URL}/browser_click", json=payload)
-
-            elif op == "type":
-                if args.get("ref"):
-                    payload = {"element": {"ref": args["ref"]}, "text": args.get("text", "")}
-                elif args.get("selector"):
-                    payload = {"selector": args["selector"], "text": args.get("text", "")}
-                else:
-                    return False, "type missing ref/selector"
-                r = http.post(f"{self.MCPO_BASE_URL}/browser_type", json=payload)
-
-            elif op == "fill_form":
-                r = http.post(f"{self.MCPO_BASE_URL}/browser_fill_form", json=args)
-
-            elif op == "press":
-                key = args.get("key", "Enter")
-                r = http.post(f"{self.MCPO_BASE_URL}/browser_press_key", json={"key": key})
-
-            elif op == "hover":
+                endpoint = "browser_click"
+                # ✅ FIX: The API expects 'element' key for both ref and selector.
                 if args.get("ref"):
                     payload = {"element": {"ref": args["ref"]}}
                 elif args.get("selector"):
-                    payload = {"selector": args["selector"]}
+                    payload = {"element": args["selector"]}
                 else:
-                    return False, "hover missing ref/selector"
-                r = http.post(f"{self.MCPO_BASE_URL}/browser_hover", json=payload)
+                    return False, "click requires 'ref' or 'selector'"
+
+            elif op == "type":
+                endpoint = "browser_type"
+                # ✅ FIX: The API expects 'element' key for both ref and selector.
+                text_to_type = args.get("text", "")
+                if args.get("ref"):
+                    payload = {"element": {"ref": args["ref"]}, "text": text_to_type}
+                elif args.get("selector"):
+                    payload = {"element": args["selector"], "text": text_to_type}
+                else:
+                    return False, "type requires 'ref' or 'selector'"
+
+            elif op == "fill_form":
+                endpoint = "browser_fill_form"
+                payload = args
+
+            elif op == "press":
+                endpoint = "browser_press_key"
+                payload = {"key": args.get("key", "Enter")}
+
+            elif op == "hover":
+                endpoint = "browser_hover"
+                # ✅ FIX: The API expects 'element' key for both ref and selector.
+                if args.get("ref"):
+                    payload = {"element": {"ref": args["ref"]}}
+                elif args.get("selector"):
+                    payload = {"element": args["selector"]}
+                else:
+                    return False, "hover requires 'ref' or 'selector'"
 
             elif op == "wait":
                 ms = int(args.get("ms", 1000))
@@ -372,20 +386,27 @@ class Pipeline:
                 return True, f"waited {ms}ms"
 
             elif op == "navigate":
-                r = http.post(f"{self.MCPO_BASE_URL}/browser_navigate", json={"url": args.get("url")})
-
+                endpoint = "browser_navigate"
+                payload = {"url": args.get("url")}
+            
             else:
                 return False, f"unknown op: {op}"
-
-            if r.status_code >= 400:
-                msg = r.text[:200]
-                if "422" in msg or "Field required" in msg:
-                    msg += " (💡 missing element field)"
-                return False, f"{op}: HTTP {r.status_code} {msg}"
-            return True, r.text[:200]
+            
+            # Centralized request sending
+            if endpoint and payload is not None:
+                r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=payload)
+                if r.status_code >= 400:
+                    msg = r.text[:250]
+                    # Provide a clearer hint for 422 errors
+                    if r.status_code == 422:
+                        msg += " (Hint: The request body may not match the API's expected schema.)"
+                    return False, f"{op}: HTTP {r.status_code} - {msg}"
+                return True, r.text[:200]
+            
+            return False, f"Could not execute op: {op}"
 
         except Exception as e:
-            return False, f"{op} error: {e}"
+            return False, f"{op} execution error: {e}"
 
 
     # ----------------------------------------------------------
@@ -393,8 +414,8 @@ class Pipeline:
     def _decide_next_action(self, goal: str, observation: str) -> str:
         """
         Returns either:
-          - JSON string like {"op":"click","ref":"e14"} / {"op":"type","ref":"e22","text":"Aachen"}
-          - or a natural language statement (we handle missing JSON)
+         - JSON string like {"op":"click","ref":"e14"} / {"op":"type","ref":"e22","text":"Aachen"}
+         - or a natural language statement (we handle missing JSON)
         """
         sys = (
             "You are a web navigation reasoning engine.\n"
