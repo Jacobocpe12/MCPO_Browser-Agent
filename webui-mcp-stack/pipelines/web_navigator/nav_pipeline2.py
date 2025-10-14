@@ -55,6 +55,38 @@ class Pipeline:
         self._step_log: List[str] = []
         self._last_snapshots: List[str] = []
 
+        # Map high-level ops → MCP endpoints (aliases resolved separately)
+        self._tool_endpoints = {
+            "click": "browser_click",
+            "type": "browser_type",
+            "navigate": "browser_navigate",
+            "scroll": "browser_scroll",
+            "hover": "browser_hover",
+            "evaluate": "browser_evaluate",
+            "close": "browser_close",
+            "resize": "browser_resize",
+            "snapshot": "browser_snapshot",
+            "take_screenshot": "browser_take_screenshot",
+            "drag": "browser_drag",
+            "select_option": "browser_select_option",
+            "mouse_move_xy": "browser_mouse_move_xy",
+            "mouse_click_xy": "browser_mouse_click_xy",
+            "handle_dialog": "browser_handle_dialog",
+            "network_requests": "browser_network_requests",
+            "console_messages": "browser_console_messages",
+            "press": "browser_press_key",
+            "file_upload": "browser_file_upload",
+            "fill_form": "browser_fill_form",
+        }
+
+        self._op_aliases = {
+            "screenshot": "take_screenshot",
+            "press_key": "press",
+            "mouse_move": "mouse_move_xy",
+            "mouse_click": "mouse_click_xy",
+            "take_snapshot": "snapshot",
+        }
+
     # ----------------------------------------------------------
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         # Pre-run hook (can modify body if needed)
@@ -486,8 +518,11 @@ class Pipeline:
             "You are a web navigation reasoning engine.\n"
             "You receive STRUCTURED SNAPSHOT (with [ref=e##]) and visible text.\n"
             "Choose ONE next action in JSON when possible.\n"
-            "Allowed ops: navigate(url), click(ref|selector), type(ref|selector,text), "
-            "press(key), hover(ref|selector), wait(ms), done(reason).\n"
+            "Allowed ops: navigate(url), click(ref|selector,doubleClick?,button?), type(ref|selector,text,submit?), "
+            "press(key,ref|selector?), hover(ref|selector), scroll(direction,ref?), wait(ms), "
+            "take_screenshot(fullPage?), snapshot(), evaluate(function,ref?|element?), drag(startRef/startSelector,endRef/endSelector), "
+            "select_option(ref|selector,values), mouse_move(x,y), mouse_click(x,y,button?), handle_dialog(accept), "
+            "file_upload(paths), fill_form(fields), resize(width,height), close(), network_requests(), console_messages(), done(reason).\n"
             "Return ONLY JSON when you can. If already done, use {\"op\":\"done\",\"reason\":\"...\"}."
         )
         messages = [
@@ -561,21 +596,66 @@ class Pipeline:
         return None
 
     def _pretty_action(self, op: str, a: Dict) -> str:
-        if op == "navigate":
+        canonical = self._op_aliases.get(op, op)
+        if canonical == "navigate":
             return f"navigate → {a.get('url','')}"
-        if op == "click":
+        if canonical == "click":
             target = a.get("ref") or a.get("selector") or "?"
-            return f"click → {target}"
-        if op == "type":
+            dbl = " (double)" if a.get("doubleClick") else ""
+            button = f" [{a.get('button')}]" if a.get("button") else ""
+            return f"click{dbl}{button} → {target}"
+        if canonical == "type":
             target = a.get("ref") or a.get("selector") or "?"
             text = a.get("text","")
-            return f"type → {target} = '{text}'"
-        if op == "press":
-            return f"press → {a.get('key','Enter')}"
-        if op == "hover":
+            submit = " (submit)" if a.get("submit") else ""
+            return f"type{submit} → {target} = '{text}'"
+        if canonical == "press":
+            target = a.get("ref") or a.get("selector")
+            scope = f" on {target}" if target else ""
+            return f"press → {a.get('key','Enter')}{scope}"
+        if canonical == "hover":
             target = a.get("ref") or a.get("selector") or "?"
             return f"hover → {target}"
-        if op == "wait":
+        if canonical == "scroll":
+            direction = a.get("direction", "?")
+            target = a.get("ref") or a.get("selector")
+            scope = f" around {target}" if target else ""
+            return f"scroll {direction}{scope}"
+        if canonical == "take_screenshot":
+            mode = " fullPage" if a.get("fullPage") else ""
+            return f"screenshot{mode}"
+        if canonical == "snapshot":
+            return "snapshot"
+        if canonical == "evaluate":
+            return "evaluate JS"
+        if canonical == "drag":
+            start = a.get("startRef") or a.get("startSelector") or "?"
+            end = a.get("endRef") or a.get("endSelector") or "?"
+            return f"drag {start} → {end}"
+        if canonical == "select_option":
+            target = a.get("ref") or a.get("selector") or "?"
+            values = ",".join(a.get("values", [])) if isinstance(a.get("values"), list) else a.get("values", "")
+            return f"select_option → {target} = [{values}]"
+        if canonical == "mouse_move_xy":
+            return f"mouse_move → ({a.get('x')},{a.get('y')})"
+        if canonical == "mouse_click_xy":
+            button = f" [{a.get('button')}]" if a.get("button") else ""
+            return f"mouse_click{button} → ({a.get('x')},{a.get('y')})"
+        if canonical == "handle_dialog":
+            return "handle_dialog → accept" if a.get("accept") else "handle_dialog → dismiss"
+        if canonical == "file_upload":
+            return f"file_upload → {len(a.get('paths', []))} file(s)"
+        if canonical == "fill_form":
+            return f"fill_form → {len(a.get('fields', []))} field(s)"
+        if canonical == "resize":
+            return f"resize → {a.get('width')}x{a.get('height')}"
+        if canonical == "close":
+            return "close browser"
+        if canonical == "network_requests":
+            return "fetch network requests"
+        if canonical == "console_messages":
+            return "fetch console messages"
+        if canonical == "wait":
             return f"wait → {a.get('ms',1000)}ms"
         return f"{op}"
 
