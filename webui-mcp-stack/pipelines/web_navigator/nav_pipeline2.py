@@ -352,9 +352,9 @@ class Pipeline:
     def _take_screenshot(self, http):
         try:
             filename = f"page-{time.strftime('%Y%m%dT%H%M%S')}.png"
-            screenshot_payload = self._make_payload("take_screenshot", {"fullPage": True})
+            screenshot_payload = self._make_payload("screenshot", {"fullPage": True})
             r = http.post(
-                f"{self.MCPO_BASE_URL}/{self._tool_endpoints['take_screenshot']}",
+                f"{self.MCPO_BASE_URL}/browser_screenshot",
                 json=self._sanitize_payload(screenshot_payload),
             )
             r.raise_for_status()
@@ -383,26 +383,58 @@ class Pipeline:
     def _exec_op(self, http, op: str, args: Dict) -> (bool, str):
         """Execute Playwright MCP operation with schema-correct payloads."""
         try:
-            canonical = self._op_aliases.get(op, op)
-            if canonical == "wait":
+            payload = None
+            endpoint = None
+
+            if op == "click":
+                endpoint = "browser_click"
+                payload = self._make_payload("click", args)
+
+            elif op == "type":
+                endpoint = "browser_type"
+                payload = self._make_payload("type", args)
+
+            elif op == "fill_form":
+                endpoint = "browser_fill_form"
+                payload = args
+
+            elif op == "press":
+                endpoint = "browser_press_key"
+                payload = {"key": args.get("key", "Enter")}
+
+            elif op == "hover":
+                endpoint = "browser_hover"
+                payload = self._make_payload("hover", args)
+
+            elif op == "wait":
                 ms = int(args.get("ms", 1000))
                 time.sleep(ms / 1000.0)
                 return True, f"waited {ms}ms"
 
-            endpoint = self._tool_endpoints.get(canonical)
-            if not endpoint:
+            elif op == "navigate":
+                endpoint = "browser_navigate"
+                payload = self._make_payload("navigate", args)
+
+            elif op == "scroll":
+                endpoint = "browser_scroll"
+                payload = self._make_payload("scroll", args)
+
+            else:
                 return False, f"unknown op: {op}"
 
-            payload = self._make_payload(canonical, args)
-            body = self._sanitize_payload(payload)
-
-            r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=body)
-            if r.status_code >= 400:
-                msg = r.text[:250]
-                if r.status_code == 422:
-                    msg += " (Hint: The request body may not match the API's expected schema.)"
-                return False, f"{op}: HTTP {r.status_code} - {msg}"
-            return True, r.text[:200]
+            # Centralized request sending
+            if endpoint and payload is not None:
+                body = self._sanitize_payload(payload)
+                r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=body)
+                if r.status_code >= 400:
+                    msg = r.text[:250]
+                    # Provide a clearer hint for 422 errors
+                    if r.status_code == 422:
+                        msg += " (Hint: The request body may not match the API's expected schema.)"
+                    return False, f"{op}: HTTP {r.status_code} - {msg}"
+                return True, r.text[:200]
+            
+            return False, f"Could not execute op: {op}"
 
         except ValueError as e:
             return False, str(e)
@@ -413,23 +445,15 @@ class Pipeline:
     def _make_payload(self, op: str, args: Optional[Dict]) -> Dict:
         """Map high-level actions to the Playwright MCP request schema."""
         args = args or {}
-        op = self._op_aliases.get(op, op)
 
         if op in {"click", "hover"}:
             ref = args.get("ref")
             selector = args.get("selector")
             if ref:
-                body: Dict[str, Union[str, bool]] = {"ref": ref}
-            elif selector:
-                body = {"selector": selector}
-            else:
-                raise ValueError(f"{op} requires 'ref' or 'selector'")
-            if op == "click":
-                if "doubleClick" in args:
-                    body["doubleClick"] = bool(args["doubleClick"])
-                if "button" in args:
-                    body["button"] = str(args["button"])
-            return body
+                return {"ref": ref}
+            if selector:
+                return {"selector": selector}
+            raise ValueError(f"{op} requires 'ref' or 'selector'")
 
         if op == "type":
             text = args.get("text")
@@ -448,24 +472,13 @@ class Pipeline:
                 body["submit"] = bool(args["submit"])
             return body
 
-        if op == "press":
-            key = args.get("key") or args.get("keys")
-            if not key:
-                raise ValueError("press requires 'key'")
-            body: Dict[str, Union[str, bool]] = {"key": str(key)}
-            if args.get("ref"):
-                body["ref"] = args["ref"]
-            elif args.get("selector"):
-                body["selector"] = args["selector"]
-            return body
-
         if op == "navigate":
             url = args.get("url")
             if not url:
                 raise ValueError("navigate requires 'url'")
             return {"url": url}
 
-        if op == "take_screenshot":
+        if op == "screenshot":
             body: Dict[str, bool] = {}
             if "fullPage" in args:
                 body["fullPage"] = bool(args["fullPage"])
@@ -478,112 +491,7 @@ class Pipeline:
             body: Dict[str, Union[str, bool]] = {"direction": direction}
             if args.get("ref"):
                 body["ref"] = args["ref"]
-            elif args.get("selector"):
-                body["selector"] = args["selector"]
             return body
-
-        if op == "evaluate":
-            function = args.get("function")
-            if not function:
-                raise ValueError("evaluate requires 'function'")
-            body: Dict[str, str] = {"function": function}
-            if args.get("ref"):
-                body["ref"] = args["ref"]
-            if args.get("element"):
-                body["element"] = args["element"]
-            elif args.get("selector"):
-                body["element"] = args["selector"]
-            return body
-
-        if op == "close":
-            return {}
-
-        if op == "resize":
-            width = args.get("width")
-            height = args.get("height")
-            if width is None or height is None:
-                raise ValueError("resize requires 'width' and 'height'")
-            return {"width": int(width), "height": int(height)}
-
-        if op == "snapshot":
-            return {}
-
-        if op == "drag":
-            body: Dict[str, str] = {}
-            start_ref = args.get("startRef") or args.get("start_ref")
-            start_selector = args.get("startSelector") or args.get("start_selector")
-            end_ref = args.get("endRef") or args.get("end_ref")
-            end_selector = args.get("endSelector") or args.get("end_selector")
-            if start_ref:
-                body["startRef"] = start_ref
-            elif start_selector:
-                body["startSelector"] = start_selector
-            else:
-                raise ValueError("drag requires 'startRef' or 'startSelector'")
-            if end_ref:
-                body["endRef"] = end_ref
-            elif end_selector:
-                body["endSelector"] = end_selector
-            else:
-                raise ValueError("drag requires 'endRef' or 'endSelector'")
-            return body
-
-        if op == "select_option":
-            values = args.get("values") or args.get("value")
-            if isinstance(values, str):
-                values = [values]
-            if not values or not isinstance(values, (list, tuple)):
-                raise ValueError("select_option requires 'values' list")
-            body: Dict[str, Union[str, List[str]]] = {"values": list(values)}
-            if args.get("ref"):
-                body["ref"] = args["ref"]
-            elif args.get("selector"):
-                body["selector"] = args["selector"]
-            else:
-                raise ValueError("select_option requires 'ref' or 'selector'")
-            return body
-
-        if op == "mouse_move_xy":
-            x = args.get("x")
-            y = args.get("y")
-            if x is None or y is None:
-                raise ValueError("mouse_move requires 'x' and 'y'")
-            return {"x": float(x), "y": float(y)}
-
-        if op == "mouse_click_xy":
-            x = args.get("x")
-            y = args.get("y")
-            if x is None or y is None:
-                raise ValueError("mouse_click requires 'x' and 'y'")
-            body: Dict[str, Union[float, str]] = {"x": float(x), "y": float(y)}
-            if args.get("button"):
-                body["button"] = str(args["button"])
-            return body
-
-        if op == "handle_dialog":
-            if "accept" not in args:
-                raise ValueError("handle_dialog requires 'accept'")
-            return {"accept": bool(args["accept"])}
-
-        if op == "network_requests":
-            return {}
-
-        if op == "console_messages":
-            return {}
-
-        if op == "file_upload":
-            paths = args.get("paths") or args.get("path")
-            if isinstance(paths, str):
-                paths = [paths]
-            if not paths or not isinstance(paths, (list, tuple)):
-                raise ValueError("file_upload requires 'paths' list")
-            return {"paths": list(paths)}
-
-        if op == "fill_form":
-            fields = args.get("fields") if isinstance(args, dict) else args
-            if not isinstance(fields, list):
-                raise ValueError("fill_form requires 'fields' list")
-            return {"fields": fields}
 
         raise ValueError(f"Unsupported payload request for op '{op}'")
 
