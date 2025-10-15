@@ -1,661 +1,485 @@
 """
-ReAct Web Navigator (Playwright MCP + Snapshot + Final Summary)
----------------------------------------------------------------
-Autonomous navigation pipeline for OpenWebUI that talks to your
-MCPO/Playwright MCP server at http://91.99.79.208:3880/mcp_playwright.
-
-Features:
-- Structured DOM snapshot reasoning (Cursor-style)
-- "ref" based precise actions (click/type/etc)
-- Screenshot + YAML structure hybrid observation
-- Multi-step ReAct loop (plan → act → observe → retry) with stop conditions
-- Streams narrated steps AND produces a final human summary at the end
+title: Browser MOA (Planner + Visual + Verifier)
+author: You
+version: 0.1.1
+description: Multi-agent browser pipeline that plans, executes MCP browser tools, streams screenshots/status, and uses a visual LLM in parallel.
 """
 
-import os
-import re
-import time
-import json
-import base64
-import httpx
-import yaml
-from typing import List, Dict, Optional, Union, Generator, Iterator
+import os, time, json, asyncio, httpx, yaml, re
+from typing import Optional, Dict, Any, List, Tuple, AsyncGenerator
 
+# --------------------------- helpers for OpenWebUI events ---------------------------
+
+def ev_status(desc: str, done: bool=False) -> Dict[str, Any]:
+    return {"event": {"type": "status", "data": {"description": desc, "done": done}}}
+
+def ev_msg_md(md: str) -> Dict[str, Any]:
+    # include role and markdown hint for better OpenWebUI rendering
+    return {"event": {"type": "message", "data": {"role": "assistant", "content": md, "content_type": "text/markdown"}}}
+
+# ------------------------------------ knobs ---------------------------------------
+
+class Knobs:
+    # Models
+    MODEL_VISUAL    = os.getenv("MODEL_VISUAL",    "gpt-4o-mini")     # visual analyzer
+    MODEL_PLANNER   = os.getenv("MODEL_PLANNER",   "gpt-4o-mini")     # planner
+    MODEL_VERIFIER  = os.getenv("MODEL_VERIFIER",  "gpt-4o-mini")     # gatekeeper
+    MODEL_SUMMARY   = os.getenv("MODEL_SUMMARY",   "gpt-4o-mini")     # finisher
+
+    # OpenAI-compatible endpoint (or your proxy)
+    # IMPORTANT: do not hard-code secrets. Let OpenWebUI provide env vars.
+    OPENAI_BASE     = os.getenv("OPENAI_BASE",     "http://localhost:11434")  # change as needed
+    OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY",  "")  # no default secret!
+
+    # MCP Playwright base
+    PLAYWRIGHT_BASE = os.getenv("PLAYWRIGHT_BASE", "http://127.0.0.1:3880/mcp_playwright")
+
+    # Public screenshot base (nginx serving /tmp/playwright-output)
+    SCREENSHOT_BASE = os.getenv("SCREENSHOT_BASE", "http://127.0.0.1:3888")
+
+    # Retries / timing
+    MAX_TOOL_RETRIES = int(os.getenv("MAX_TOOL_RETRIES", "5"))
+    STEP_LIMIT       = int(os.getenv("STEP_LIMIT", "15"))
+
+    # Session
+    IMG_DIR          = os.getenv("IMG_DIR", "/tmp/playwright-output")
+
+    SYS_VERIFIER = os.getenv("SYS_VERIFIER","""You are the gatekeeper for a web-browsing agent.
+Given a user's message, decide if it requires using the BROWSER PIPELINE.
+
+If the task involves visiting or operating real websites, clicking, scrolling, or visual inspection, return `use_pipeline: true`.
+
+Also, define a structured goal if possible.
+
+Return JSON in this exact format:
+
+{
+ "use_pipeline": true|false,
+ "goal": "<normalized concise goal or null>",
+ "intent": "<search|form_fill|scraping|navigation|analysis|unknown>",
+ "targets": ["optional list of domains or keywords"]
+}
+
+Never include extra text or comments.""")
+    SYS_PLANNER = os.getenv("SYS_PLANNER","""You are the Planner. You receive: GOAL and OBSERVATION.
+Available tools: browser_install, browser_navigate, browser_wait_for, browser_snapshot,
+browser_click, browser_type, browser_press_key, browser_drag, browser_hover, browser_select_option,
+browser_take_screenshot, browser_evaluate, browser_resize, browser_navigate_back, browser_close,
+browser_pdf_save, browser_console_messages, browser_network_requests, browser_mouse_move_xy,
+browser_mouse_click_xy, browser_mouse_drag_xy, browser_file_upload, browser_fill_form.
+Respond ONLY JSON for the next action:
+{"op":"navigate","url":"..."}
+{"op":"click","ref":"e12"}        # or {"selector":"..."}
+{"op":"type","ref":"e7","text":"...","submit":true}
+{"op":"press","key":"Enter"}
+{"op":"wait","ms":1200}
+{"op":"screenshot"}
+{"op":"done","reason":"..."}
+Reason in your head, output only JSON.""")
+    SYS_VISUAL = os.getenv("SYS_VISUAL","""You analyze a screenshot URL plus a YAML snapshot. Return strict JSON:
+{
+ "view":"map|list|form|article|unknown",
+ "center":"<text or null>",
+ "zoom": "<int or null>",
+ "notable_elements":[{"ref":"e12","role":"button","text":"Login"}],
+ "obstacles":[ "cookie_banner" ],
+ "next_click_hint": {"ref":"e12"}
+}
+No prose. Use nulls when unknown.""")
+    SYS_SUMMARY = os.getenv("SYS_SUMMARY","""Write a concise, user-friendly summary of what the browsing agent did,
+what it found, and the final outcome. Include key URLs if helpful. Keep it short and clear.""")
+
+    SYS_GOAL_EXTRACTOR = os.getenv("SYS_GOAL_EXTRACTOR", """You are a goal normalizer for a web-browsing agent.
+The user provides an ambiguous text. Return a normalized JSON goal description:
+
+{
+ "goal": "<concise statement of what to achieve>",
+ "intent": "<search|form_filling|scraping|navigation|analysis|unknown>",
+ "targets": ["optional list of domains or keywords"]
+}
+
+If the text is pure chat or not browser-related, keep "intent": "unknown".
+Return only valid JSON.
+""")
+
+
+# ----------------------------------- tools ----------------------------------------
+
+class BrowserTool:
+    def __init__(self, base: str, img_dir: str, screenshot_base: str, retries: int):
+        self.base = base.rstrip("/")
+        self.img_dir = img_dir
+        self.screenshot_base = screenshot_base.rstrip("/")
+        self.retries = retries
+
+    def _url(self, ep: str) -> str:
+        return f"{self.base}/{ep.lstrip('/')}"
+
+    def _retry(self):
+        for i in range(self.retries):
+            yield i, min(2 ** i * 0.2, 2.0)
+
+    def _post(self, ep: str, json_body: Optional[Dict]=None) -> httpx.Response:
+        with httpx.Client(timeout=httpx.Timeout(60, read=60, connect=30)) as http:
+            return http.post(self._url(ep), json=json_body or {})
+
+    def install(self) -> Tuple[bool, str]:
+        for _, sleep_s in self._retry():
+            try:
+                r = self._post("/browser_install", {})
+                if r.status_code < 400:
+                    return True, "installed"
+                time.sleep(sleep_s)
+            except Exception:
+                time.sleep(sleep_s)
+        return False, "install_failed"
+
+    def navigate(self, url: str) -> Tuple[bool, str]:
+        payload = {"url": url}
+        for _, sleep_s in self._retry():
+            try:
+                r = self._post("/browser_navigate", payload)
+                if r.status_code < 400:
+                    return True, "navigated"
+                time.sleep(sleep_s)
+            except Exception:
+                time.sleep(sleep_s)
+        return False, f"navigate_failed:{url}"
+
+    def wait_for(self, selector_or_ref: str=None, timeout_ms: int=3000) -> Tuple[bool,str]:
+        payload = {}
+        if selector_or_ref:
+            if selector_or_ref.startswith("e"): payload["ref"] = selector_or_ref
+            else: payload["selector"] = selector_or_ref
+        payload["timeout"] = timeout_ms
+        for _, sleep_s in self._retry():
+            try:
+                r = self._post("/browser_wait_for", payload)
+                if r.status_code < 400:
+                    return True, "ready"
+                time.sleep(sleep_s)
+            except Exception:
+                time.sleep(sleep_s)
+        return False, "wait_failed"
+
+    def snapshot(self) -> Tuple[bool, str]:
+        for _, sleep_s in self._retry():
+            try:
+                r = self._post("/browser_snapshot", {})
+                if r.status_code < 400:
+                    data = r.json()
+                    result = data.get("result", data)
+                    if isinstance(result, str) and (result.startswith("{") or result.startswith("[")):
+                        try:
+                            result = yaml.dump(json.loads(result), sort_keys=False, allow_unicode=True)
+                        except Exception:
+                            pass
+                    return True, result if isinstance(result, str) else str(result)
+                time.sleep(sleep_s)
+            except Exception:
+                time.sleep(sleep_s)
+        return False, "snapshot_failed"
+
+    def click(self, ref: Optional[str]=None, selector: Optional[str]=None) -> Tuple[bool,str]:
+        payload = {}
+        if ref: payload["ref"] = ref
+        elif selector: payload["selector"] = selector
+        else: return False, "click_missing_target"
+        for _, sleep_s in self._retry():
+            try:
+                r = self._post("/browser_click", payload)
+                if r.status_code < 400:
+                    return True, "clicked"
+                time.sleep(sleep_s)
+            except Exception:
+                time.sleep(sleep_s)
+        return False, "click_failed"
+
+    def type(self, text: str, ref: Optional[str]=None, selector: Optional[str]=None, submit: bool=False) -> Tuple[bool,str]:
+        payload = {"text": text, "submit": bool(submit)}
+        if ref: payload["ref"] = ref
+        elif selector: payload["selector"] = selector
+        else: return False, "type_missing_target"
+        for _, sleep_s in self._retry():
+            try:
+                r = self._post("/browser_type", payload)
+                if r.status_code < 400:
+                    return True, "typed"
+                time.sleep(sleep_s)
+            except Exception:
+                time.sleep(sleep_s)
+        return False, "type_failed"
+
+    def press(self, key: str="Enter") -> Tuple[bool,str]:
+        for _, sleep_s in self._retry():
+            try:
+                r = self._post("/browser_press_key", {"key": key})
+                if r.status_code < 400:
+                    return True, "pressed"
+                time.sleep(sleep_s)
+            except Exception:
+                time.sleep(sleep_s)
+        return False, "press_failed"
+
+    def screenshot(self, descriptive: str) -> Tuple[bool, str]:
+        fn = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", descriptive) + ".png"
+        path = f"{self.img_dir}/{fn}"
+        payload = {"fullPage": True, "filename": path}
+        for _, sleep_s in self._retry():
+            try:
+                r = self._post("/browser_take_screenshot", payload)
+                if r.status_code < 400:
+                    return True, f"{Knobs.SCREENSHOT_BASE}/{fn}?ts={int(time.time()*1000)}"
+                time.sleep(sleep_s)
+            except Exception:
+                time.sleep(sleep_s)
+        return False, "screenshot_failed"
+
+
+# ------------------------------- LLM wrapper --------------------------------------
+
+async def chat_complete(messages: List[Dict], model: str, expect_json: bool=False) -> str:
+    payload = {"model": model, "messages": messages, "stream": False}
+    headers = {"Authorization": f"Bearer {Knobs.OPENAI_API_KEY}"} if Knobs.OPENAI_API_KEY else {}
+
+    base = Knobs.OPENAI_BASE.rstrip("/")
+    candidates = [
+        f"{base}/v1/chat/completions",
+        f"{base}/chat/completions",
+        f"{base}/api/v1/chat/completions",
+        f"{base}/api/chat/completions",
+    ]
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(90, read=90, connect=30)) as http:
+        last_error = None
+        for url in candidates:
+            try:
+                r = await http.post(url, json=payload, headers=headers)
+                if r.status_code < 400:
+                    data = r.json()
+                    out = data["choices"][0]["message"]["content"]
+                    if expect_json:
+                        s, e = out.find("{"), out.rfind("}")
+                        if s != -1 and e != -1 and e > s:
+                            return out[s:e+1]
+                    return out
+            except Exception as e:
+                last_error = e
+                continue
+        # If nothing worked, raise the last error to surface it in the UI
+        raise RuntimeError(f"chat_complete failed against {candidates}: {last_error}")
+
+# ---------------------------------- pipeline --------------------------------------
 
 class Pipeline:
     def __init__(self):
-        self.name = "ReAct Web Navigator (Playwright MCP, snapshot, summary)"
-        self.description = (
-            "Autonomous browser agent using Playwright MCP. "
-            "Combines structured snapshots and screenshots for reasoning, "
-            "streams steps, and returns a final summary."
-        )
-        self.version = "5.1.0" # Version incremented for fix
-        self.author = "You + Gemini"
-        self.debug = False
-
-        # === Core endpoints (MCPO proxy) ===
-        self.MCPO_BASE_URL = "http://91.99.79.208:3880/mcp_playwright"
-
-        # === Model config (OpenAI-compatible) ===
-        # You can override via environment:
-        #   OPENAI_API_KEY, OPENAI_BASE, MODEL_NAME
-        self.OPENAI_BASE = os.getenv("OPENAI_BASE", "https://ollama.gpu.lfi.rwth-aachen.de/api")
-        self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-        self.MODEL_NAME = os.getenv("MODEL_NAME", "azure.gpt-4o-sweden")
-
-        # === Loop & I/O ===
-        self.LOCAL_IMG_DIR = "/tmp/playwright-output"
-        os.makedirs(self.LOCAL_IMG_DIR, exist_ok=True)
-        self.MAX_STEPS = 12
-        self.NO_PROGRESS_LIMIT = 3  # if snapshot unchanged N times → ask user / stop
-        self.SCREENSHOT_PUBLIC_BASE = "http://91.99.79.208:3888"
-
-        # Track for summary
-        self._step_log: List[str] = []
-        self._last_snapshots: List[str] = []
-
-    # ----------------------------------------------------------
-    async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
-        # Pre-run hook (can modify body if needed)
-        if self.debug:
-            print("[nav] inlet keys:", list((body or {}).keys()))
-        return body
-
-    # ----------------------------------------------------------
-    # MAIN PIPELINE (OpenWebUI-compatible)
-    # ----------------------------------------------------------
-    def pipe(
-        self,
-        user_message: str,
-        model_id: str,
-        messages: List[dict],
-        body: dict,
-    ) -> Union[str, Generator, Iterator]:
-
-        # === Maintain in-memory session between calls ===
-        if not hasattr(self, "session"):
-            class _Session:
-                last_goal = None
-                last_snapshot = None
-                last_error = None
-                tool_mode = False
-            self.session = _Session()
-
-        # === Detect intent (chat vs tool) ===
-        intent = self._infer_intent(user_message)
-        is_followup = (
-            self.session.last_goal
-            and len(user_message.split()) < 30
-            and not re.search(r"https?://", user_message)
-            and intent == "tool"
-        )
-
-        # === If it's a normal chat ===
-        if intent == "chat" and not self.session.tool_mode:
-            yield self._status("💬 Detected chat intent — replying normally.")
-            reply = self._chat([
-                {"role": "system", "content": "You are a helpful conversational assistant."},
-                {"role": "user", "content": user_message},
-            ])
-            yield reply
-            yield self._status("✅ Finished.", done=True)
-            return
-
-        # === Continue previous navigation ===
-        if is_followup:
-            yield self._status("🧩 Detected follow-up — continuing previous navigation.")
-            goal = f"{self.session.last_goal}. Update based on user feedback: {user_message}"
-        else:
-            goal = self._extract_prompt(messages) or user_message or ""
-            goal = self._rewrite_goal(goal)
-            self.session.last_goal = goal
-            self.session.tool_mode = True
-
-        if not goal.strip():
-            yield self._status("❌ No navigation prompt provided.", done=True)
-            return
-
-        # === Start navigation ===
-        yield self._status(f"🔧 Using model: {self.MODEL_NAME} @ {self.OPENAI_BASE}")
-        yield self._status(f"🎯 Goal: {goal}")
-
-        self._step_log.clear()
-        self._last_snapshots.clear()
-
-        try:
-            with httpx.Client(timeout=httpx.Timeout(60, read=60, connect=30)) as http:
-                yield self._status("🛠️ Boot: initializing Playwright session…")
-
-                start_url = self._extract_url(goal)
-                self._step_log.append(f"Navigate → {start_url}")
-                nav_payload = self._make_payload("navigate", {"url": start_url})
-                nav_res = self._call_mcp(http, "browser_navigate", nav_payload)
-                yield self._status(f"🛠️ navigate → {start_url}")
-
-                # First observation
-                snapshot = self._browser_snapshot(http)
-                if snapshot:
-                    self._last_snapshots.append(snapshot)
-                    yield self._status("📖 Snapshot captured (structured YAML).")
-                    yield self._status(self._clip(snapshot, 1800))
-
-                b64, pub = self._take_screenshot(http)
-                if b64:
-                    yield self._image_event(b64)
-                    self._step_log.append("Screenshot displayed inline.")
-                elif pub:
-                    yield self._status(f"👀 Screenshot available at {pub}")
-
-                # === ReAct Loop ===
-                for step in range(1, self.MAX_STEPS + 1):
-                    obs = self._build_observation(http, snapshot)
-
-                    action = self._decide_next_action(goal, obs)
-                    action_json = self._to_json(action)
-
-                    if not action_json or "op" not in action_json:
-                        if isinstance(action, str) and "done" in action.lower():
-                            yield self._status("✅ Model indicated completion.")
-                            break
-                        yield self._status("ℹ️ No structured action detected; stopping.")
-                        break
-
-                    op = action_json.get("op")
-                    if op in ("done", "finish", "stop"):
-                        reason = action_json.get("reason", "No reason provided.")
-                        yield self._status(f"✅ Done: {reason}")
-                        break
-
-                    nice = self._pretty_action(op, action_json)
-                    self._step_log.append(nice)
-                    yield self._status(f"🛠️ Step {step}: {nice}")
-
-                    exec_ok, exec_msg = self._exec_op(http, op, action_json)
-                    if not exec_ok:
-                        self.session.last_error = exec_msg
-                        self._step_log.append(f"⚠️ Action failed → {exec_msg}")
-                        yield self._status(f"⚠️ Action failed → {exec_msg}")
-                    else:
-                        self._step_log.append(f"Executed: {op}")
-
-                    snapshot = self._browser_snapshot(http)
-                    if snapshot:
-                        yield self._status("📖 Snapshot updated.")
-                        yield self._status(self._clip(snapshot, 1800))
-                        self._last_snapshots.append(snapshot)
-                        self.session.last_snapshot = snapshot
-
-                    b64, pub = self._take_screenshot(http)
-                    if b64:
-                        yield self._image_event(b64)
-                        self._step_log.append("Screenshot displayed inline.")
-                    elif pub:
-                        yield self._status(f"👀 Screenshot available at {pub}")
-
-                    if self._is_stuck():
-                        yield self._status("🤔 Page state unchanged — stopping.")
-                        break
-
-                # Final summary
-                final_summary = self._final_summary(goal, self._step_log, snapshot)
-                yield self._status("📦 Preparing final answer…")
-                yield final_summary
-                yield self._status("✅ Finished.", done=True)
-
-        except Exception as e:
-            if self.debug:
-                import traceback
-                traceback.print_exc()
-            self.session.last_error = str(e)
-            yield self._status(f"💥 Pipeline error: {e}", done=True)
-
-    # ----------------------------------------------------------
-    # Helpers: Prompt, URL, Observation, Stuck
-    def _extract_prompt(self, messages: List[dict]) -> Optional[str]:
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                c = m.get("content")
-                if isinstance(c, str):
-                    return c
-                if isinstance(c, list):
-                    texts = [b.get("text") for b in c if isinstance(b, dict) and b.get("type") == "text"]
-                    txt = "\n".join(t for t in texts if t)
-                    if txt:
-                        return txt
-        return None
-
-    def _extract_url(self, text: str) -> str:
-        url = None
-        # full URL present?
-        m = re.search(r"(https?://[^\s\"']+)", text) # Avoid trailing quotes
-        if m:
-            url = m.group(1)
-        
-        # domain-like (example.de, example.com)
-        elif re.search(r"\b([\w-]+\.(com|org|net|edu|gov|info|io|ai|de|nl|fr|es|it|ch))\b", text, re.I):
-             m = re.search(r"\b([\w-]+\.(com|org|net|edu|gov|info|io|ai|de|nl|fr|es|it|ch))\b", text, re.I)
-             if m:
-                url = f"https://{m.group(1)}"
-        
-        # Fallback to search if no clear URL
-        else:
-            # Use a search engine for ambiguous queries
-            from urllib.parse import quote_plus
-            query = re.sub(r'[^a-zA-Z0-9\s-]', '', text).strip()
-            url = f"https://www.google.com/search?q={quote_plus(query)}"
-
-        # ✅ FIX: Final sanitization to remove common trailing punctuation.
-        if url:
-            return url.strip().rstrip('.,;:"\'')
-            
-        return "https://www.google.com" # Default fallback
-
-
-    def _build_observation(self, http, snapshot_text: Optional[str]) -> str:
-        parts = []
-        # Page URL + Title (lightweight query)
-        try:
-            # ✅ FIX: The API expects the key "expression", not "script".
-            payload = {"expression": "({url: location.href, title: document.title})"}
-            r = http.post(f"{self.MCPO_BASE_URL}/browser_evaluate", json=payload)
-            if r.status_code == 200:
-                data = r.json().get("result", {})
-                parts.append(f"URL: {data.get('url','?')}")
-                parts.append(f"TITLE: {data.get('title','?')}")
-        except Exception:
-            pass
-
-        # Visible text (truncated) for context
-        try:
-            # ✅ FIX: The API expects the key "expression", not "script".
-            payload = {"expression": "document.body.innerText.slice(0,4000)"}
-            r = http.post(f"{self.MCPO_BASE_URL}/browser_evaluate", json=payload)
-            if r.status_code == 200:
-                txt = r.json().get("result", "") or ""
-                parts.append("VISIBLE_TEXT:")
-                parts.append(self._clip(txt, 1200))
-        except Exception:
-            pass
-
-        # Structured snapshot
-        if snapshot_text:
-            parts.append("STRUCTURED SNAPSHOT:")
-            parts.append(self._clip(snapshot_text, 4000))
-
-        return "\n".join(parts)
-
-    def _is_stuck(self) -> bool:
-        if len(self._last_snapshots) < self.NO_PROGRESS_LIMIT:
-            return False
-        tail = self._last_snapshots[-self.NO_PROGRESS_LIMIT:]
-        # crude identical check
-        return all(s.strip() == tail[0].strip() for s in tail)
-
-    # ----------------------------------------------------------
-    # MCP calls: generic + snapshot + screenshot + exec
-    def _call_mcp(self, http, endpoint: str, payload: dict = None):
-        try:
-            body = self._sanitize_payload(payload or {})
-            r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=body)
-            r.raise_for_status()
-            data = r.json()
-            return data.get("result") or data
-        except Exception as e:
-            return {"error": str(e)}
-
-    def _browser_snapshot(self, http) -> Optional[str]:
-        try:
-            r = http.post(f"{self.MCPO_BASE_URL}/browser_snapshot")
-            r.raise_for_status()
-            data = r.json()
-            result = data.get("result") if isinstance(data, dict) else str(data)
-            # If JSON-ish, pretty YAML it for LLM
-            if isinstance(result, str) and (result.strip().startswith("{") or result.strip().startswith("[")):
-                result = yaml.dump(json.loads(result), sort_keys=False, allow_unicode=True)
-            return result
-        except Exception as e:
-            return f"[snapshot error: {e}]"
-
-    def _take_screenshot(self, http):
-        try:
-            filename = f"page-{time.strftime('%Y%m%dT%H%M%S')}.png"
-            screenshot_payload = self._make_payload("screenshot", {"fullPage": True})
-            r = http.post(
-                f"{self.MCPO_BASE_URL}/browser_screenshot",
-                json=self._sanitize_payload(screenshot_payload),
-            )
-            r.raise_for_status()
-            result = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
-            if isinstance(result, dict):
-                b64 = result.get("result") or result.get("base64")
-                if b64:
-                    return b64, None
-                path = result.get("path")
-                if path and os.path.exists(path):
-                    with open(path, "rb") as f:
-                        b64 = base64.b64encode(f.read()).decode("utf-8")
-                    return b64, None
-            elif isinstance(result, str):
-                return result, None
-            # Fallback: try to load from shared directory if Playwright saved the file.
-            local_path = os.path.join(self.LOCAL_IMG_DIR, filename)
-            if os.path.exists(local_path):
-                with open(local_path, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("utf-8")
-                return b64, None
-            return None, None
-        except Exception as e:
-            return None, f"[screenshot error: {e}]"
-
-    def _exec_op(self, http, op: str, args: Dict) -> (bool, str):
-        """Execute Playwright MCP operation with schema-correct payloads."""
-        try:
-            payload = None
-            endpoint = None
-
-            if op == "click":
-                endpoint = "browser_click"
-                payload = self._make_payload("click", args)
-
-            elif op == "type":
-                endpoint = "browser_type"
-                payload = self._make_payload("type", args)
-
-            elif op == "fill_form":
-                endpoint = "browser_fill_form"
-                payload = args
-
-            elif op == "press":
-                endpoint = "browser_press_key"
-                payload = {"key": args.get("key", "Enter")}
-
-            elif op == "hover":
-                endpoint = "browser_hover"
-                payload = self._make_payload("hover", args)
-
-            elif op == "wait":
-                ms = int(args.get("ms", 1000))
-                time.sleep(ms / 1000.0)
-                return True, f"waited {ms}ms"
-
-            elif op == "navigate":
-                endpoint = "browser_navigate"
-                payload = self._make_payload("navigate", args)
-
-            elif op == "scroll":
-                endpoint = "browser_scroll"
-                payload = self._make_payload("scroll", args)
-
-            else:
-                return False, f"unknown op: {op}"
-
-            # Centralized request sending
-            if endpoint and payload is not None:
-                body = self._sanitize_payload(payload)
-                r = http.post(f"{self.MCPO_BASE_URL}/{endpoint}", json=body)
-                if r.status_code >= 400:
-                    msg = r.text[:250]
-                    # Provide a clearer hint for 422 errors
-                    if r.status_code == 422:
-                        msg += " (Hint: The request body may not match the API's expected schema.)"
-                    return False, f"{op}: HTTP {r.status_code} - {msg}"
-                return True, r.text[:200]
-            
-            return False, f"Could not execute op: {op}"
-
-        except ValueError as e:
-            return False, str(e)
-        except Exception as e:
-            return False, f"{op} execution error: {e}"
-
-
-    def _make_payload(self, op: str, args: Optional[Dict]) -> Dict:
-        """Map high-level actions to the Playwright MCP request schema."""
-        args = args or {}
-
-        if op in {"click", "hover"}:
-            ref = args.get("ref")
-            selector = args.get("selector")
-            if ref:
-                return {"ref": ref}
-            if selector:
-                return {"selector": selector}
-            raise ValueError(f"{op} requires 'ref' or 'selector'")
-
-        if op == "type":
-            text = args.get("text")
-            ref = args.get("ref")
-            selector = args.get("selector")
-            if not text:
-                raise ValueError("type requires 'text'")
-            body: Dict[str, Union[str, bool]] = {"text": text}
-            if ref:
-                body["ref"] = ref
-            elif selector:
-                body["selector"] = selector
-            else:
-                raise ValueError("type requires 'ref' or 'selector'")
-            if "submit" in args:
-                body["submit"] = bool(args["submit"])
-            return body
-
-        if op == "navigate":
-            url = args.get("url")
-            if not url:
-                raise ValueError("navigate requires 'url'")
-            return {"url": url}
-
-        if op == "screenshot":
-            body: Dict[str, bool] = {}
-            if "fullPage" in args:
-                body["fullPage"] = bool(args["fullPage"])
-            return body
-
-        if op == "scroll":
-            direction = args.get("direction")
-            if direction not in {"up", "down"}:
-                raise ValueError("scroll requires 'direction' of 'up' or 'down'")
-            body: Dict[str, Union[str, bool]] = {"direction": direction}
-            if args.get("ref"):
-                body["ref"] = args["ref"]
-            return body
-
-        raise ValueError(f"Unsupported payload request for op '{op}'")
-
-    def _sanitize_payload(self, body: Optional[Dict]) -> Dict:
-        body = dict(body or {})
-        if "element" in body and isinstance(body["element"], dict) and "ref" in body["element"]:
-            body["ref"] = body["element"]["ref"]
-            del body["element"]
-        elif "element" in body and isinstance(body["element"], str):
-            body["selector"] = body["element"]
-            del body["element"]
-        return body
-
-
-    # ----------------------------------------------------------
-    # LLM calls: decide next action + final summary
-    def _decide_next_action(self, goal: str, observation: str) -> str:
-        """
-        Returns either:
-         - JSON string like {"op":"click","ref":"e14"} / {"op":"type","ref":"e22","text":"Aachen"}
-         - or a natural language statement (we handle missing JSON)
-        """
-        sys = (
-            "You are a web navigation reasoning engine.\n"
-            "You receive STRUCTURED SNAPSHOT (with [ref=e##]) and visible text.\n"
-            "Choose ONE next action in JSON when possible.\n"
-            "Allowed ops: navigate(url), click(ref|selector), type(ref|selector,text), "
-            "press(key), hover(ref|selector), wait(ms), done(reason).\n"
-            "Return ONLY JSON when you can. If already done, use {\"op\":\"done\",\"reason\":\"...\"}."
-        )
-        messages = [
-            {"role": "system", "content": sys},
-            {"role": "user", "content": f"Goal: {goal}\n\n{observation}"},
-        ]
-        return self._chat(messages)
-
-    def _final_summary(self, goal: str, steps: List[str], last_snapshot: Optional[str]) -> str:
-        # Try LLM summary; if it fails, fallback to deterministic summary.
-        bullets = "\n".join(f"- {s}" for s in steps[-12:])
-        prompt = (
-            "Summarize the browsing session clearly for the user. "
-            "Explain what was attempted, what worked, and the final state. "
-            "Keep it concise and actionable.\n\n"
-            f"Goal: {goal}\nRecent steps:\n{bullets}\n"
-            "If a screenshot URL is mentioned, include it as the result link."
-        )
-        messages = [
-            {"role": "system", "content": "You write clear, concise summaries for non-technical users."},
-            {"role": "user", "content": prompt},
-        ]
-        summary = self._chat(messages, expect_json=False)
-        if summary.startswith("❌"):
-            # Fallback
-            final = ["### Result",
-                     f"- Goal: {goal}",
-                     f"- Steps executed: {len(steps)}",
-                     "- Recent actions:"]
-            final += [f"  {s}" for s in steps[-6:]]
-            return "\n".join(final)
-        return summary
-
-    def _chat(self, messages: List[Dict], expect_json: bool = False) -> str:
-        payload = {
-            "model": self.MODEL_NAME,
-            "messages": messages,
-            "stream": False,
+        self.knobs = Knobs()
+        self.session: Dict[str, Any] = {
+            "goal": None,
+            "last_snapshot": None,
+            "step_log": [],
+            "visual_last": None
         }
-        headers = {}
-        if self.OPENAI_API_KEY:
-            headers["Authorization"] = f"Bearer {self.OPENAI_API_KEY}"
+        self.browser = BrowserTool(
+            base=Knobs.PLAYWRIGHT_BASE,
+            img_dir=Knobs.IMG_DIR,
+            screenshot_base=Knobs.SCREENSHOT_BASE,
+            retries=Knobs.MAX_TOOL_RETRIES,
+        )
+
+    async def pipe(self, user_message: str, model_id: Optional[str], messages: List[dict], body: dict) -> AsyncGenerator[Dict[str, Any], None]:
+        # 1) Gate: should we run the pipeline?
+        raw_goal = self._extract_goal(messages) or (user_message or "")
+        yield ev_status("📨 Reading messages...", done=False)
+        if not raw_goal.strip():
+            yield ev_status("❌ Empty goal received — stopping.", done=True)
+            return
 
         try:
-            # Some OpenAI-compatible servers use /api/chat/completions (OpenWebUI),
-            # others use /v1/chat/completions. Try /v1 first, then fallback.
-            url1 = f"{self.OPENAI_BASE.rstrip('/')}/v1/chat/completions"
-            r = httpx.post(url1, json=payload, headers=headers, timeout=90)
-            if r.status_code == 404:
-                url2 = f"{self.OPENAI_BASE.rstrip('/')}/api/chat/completions"
-                r = httpx.post(url2, json=payload, headers=headers, timeout=90)
-            r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"]["content"]
+            decision_json = await chat_complete(
+                [{"role": "system", "content": self.knobs.SYS_VERIFIER},
+                 {"role": "user", "content": raw_goal}],
+                self.knobs.MODEL_VERIFIER,
+                expect_json=True
+            )
+            decision = json.loads(decision_json)
+        except Exception:
+            # Fallback if parsing fails
+            decision = {"use_pipeline": True, "goal": raw_goal, "intent": "unknown", "targets": []}
+
+        use_pipeline = bool(decision.get("use_pipeline", False))
+        goal        = decision.get("goal") or raw_goal
+
+        # ✅ Display decision
+        yield ev_msg_md(f"🤖 **Verifier Decision:**\n\n```json\n{json.dumps(decision, indent=2)}\n```")
+
+        # 🧩 If pipeline not needed → stop here
+        if not use_pipeline:
+            yield ev_status("💬 Verifier: pipeline not required.", done=True)
+            yield ev_msg_md("This query doesn't require browser actions.")
+            return
+
+        # Otherwise set and announce the goal
+        self.session["goal"] = goal
+        yield ev_status(f"🧭 Pipeline activated for goal: {goal}", done=False)
+
+        # 2) Start session / install browser
+        yield ev_status("🧩 Installing/starting browser…", done=False)
+        ok, msg = await asyncio.to_thread(self.browser.install)
+        # mark install step
+        yield ev_status(f"🧩 {msg}", done=True)
+        if not ok:
+            yield ev_msg_md("❌ Browser install failed. Check MCP Playwright server address and availability.")
+            return
+
+        # 3) Main loop
+        for step in range(1, Knobs.STEP_LIMIT + 1):
+            # Build observation for planner (include last snapshot + last visual)
+            obs_text = self._observation_text()
+
+            # Ask planner for next action (JSON only)
+            try:
+                plan_json = await chat_complete(
+                    [{"role":"system","content":self.knobs.SYS_PLANNER},
+                     {"role":"user","content":f"GOAL:\n{goal}\n\nOBSERVATION:\n{obs_text}"}],
+                    self.knobs.MODEL_PLANNER, expect_json=True
+                )
+            except Exception as e:
+                yield ev_msg_md(f"⚠️ Planner request failed: `{e}`. Stopping.")
+                break
+
+            act = self._parse_json(plan_json)
+            if not act:
+                yield ev_status("ℹ️ Planner returned no structured action; stopping.", done=True)
+                break
+
+            if act.get("op") in ("done","finish","stop"):
+                reason = act.get("reason","done")
+                yield ev_status(f"✅ Done: {reason}", done=True)
+                break
+
+            # 4) Execute action via BrowserTool
+            nice = self._nice_action(act)
+            self.session["step_log"].append(nice)
+            yield ev_status(f"🛠️ {nice}", done=False)
+
+            ok, exec_msg = await asyncio.to_thread(self._exec, act)
+            if not ok:
+                self.session["step_log"].append(f"⚠️ {exec_msg}")
+                yield ev_status(f"⚠️ {exec_msg} (retrying may occur)", done=False)
+
+            # 5) Snapshot + Screenshot + parallel visual analysis
+            snap_ok, snapshot = await asyncio.to_thread(self.browser.snapshot)
+            if snap_ok:
+                self.session["last_snapshot"] = snapshot
+                clipped = self._clip(snapshot, 1200)
+                yield ev_msg_md("📖 **Snapshot (YAML, clipped)**\n\n```\n" + clipped + "\n```")
+
+            shot_ok, url_or_err = await asyncio.to_thread(self.browser.screenshot, f"step_{step}_{int(time.time())}")
+            if shot_ok:
+                shot_url = url_or_err
+                yield ev_msg_md(f"📸 **View after step {step}:**\n\n![frame]({shot_url})")
+                # Launch visual analysis in parallel (do not block)
+                asyncio.create_task(self._run_visual(shot_url, self.session.get("last_snapshot")))
+            else:
+                yield ev_status("⚠️ Screenshot failed", done=False)
+
+        # 6) Final summary
+        yield ev_status("📦 Summarizing…", done=False)
+        try:
+            final_summary = await chat_complete(
+                [{"role":"system","content":self.knobs.SYS_SUMMARY},
+                 {"role":"user","content":self._summary_prompt()}],
+                self.knobs.MODEL_SUMMARY, expect_json=False
+            )
+            yield ev_msg_md(final_summary)
         except Exception as e:
-            return f"❌ LLM error: {e}"
+            yield ev_msg_md(f"⚠️ Summary failed: `{e}`")
 
-    # ----------------------------------------------------------
-    # Utilities
-    def _to_json(self, s: str) -> Optional[Dict]:
-        if not isinstance(s, str):
-            return None
-        # Extract first {...} block
+        yield ev_status("✅ Finished.", done=True)
+
+    # ---------------- helpers ----------------
+    def _exec(self, a: Dict) -> Tuple[bool,str]:
+        op = a.get("op")
+        if op == "navigate":
+            return self.browser.navigate(a.get("url",""))
+        if op == "click":
+            return self.browser.click(ref=a.get("ref"), selector=a.get("selector"))
+        if op == "type":
+            return self.browser.type(text=a.get("text",""), ref=a.get("ref"), selector=a.get("selector"), submit=bool(a.get("submit", False)))
+        if op == "press":
+            return self.browser.press(a.get("key","Enter"))
+        if op == "wait":
+            ms = int(a.get("ms", 800))
+            time.sleep(ms/1000.0); return True, f"waited {ms}ms"
+        if op == "screenshot":
+            return self.browser.screenshot(f"manual_{int(time.time())}")
+        return False, f"unknown_op:{op}"
+
+    async def _run_visual(self, shot_url: str, snapshot: Optional[str]):
+        obs = f"SCREENSHOT_URL: {shot_url}\n\nSNAPSHOT_YAML:\n{self._clip(snapshot or '', 4000)}"
         try:
-            start = s.find("{")
-            end = s.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                return json.loads(s[start:end+1])
+            out = await chat_complete(
+                [{"role": "system", "content": self.knobs.SYS_VISUAL},
+                 {"role": "user", "content": obs}],
+                self.knobs.MODEL_VISUAL, expect_json=True
+            )
+            parsed = json.loads(out)
+        except Exception:
+            parsed = {"view": "unknown", "center": None, "zoom": None,
+                      "notable_elements": [], "obstacles": []}
+        self.session["visual_last"] = parsed
+
+    def _observation_text(self) -> str:
+        parts = []
+        if self.session.get("last_snapshot"):
+            parts.append("STRUCTURED_SNAPSHOT:\n" + self._clip(self.session["last_snapshot"], 2000))
+        if self.session.get("visual_last"):
+            parts.append("VISUAL_ANALYSIS_JSON:\n" + json.dumps(self.session["visual_last"], ensure_ascii=False))
+        return "\n\n".join(parts) if parts else "(no observation yet)"
+
+    def _summary_prompt(self) -> str:
+        steps = "\n".join(f"- {s}" for s in self.session["step_log"][-20:])
+        return f"Goal:\n{self.session.get('goal','')}\n\nRecent steps:\n{steps}\n"
+
+    def _parse_json(self, s: str) -> Optional[Dict]:
+        if not isinstance(s, str): return None
+        try:
+            i, j = s.find("{"), s.rfind("}")
+            if i != -1 and j != -1 and j > i:
+                return json.loads(s[i:j+1])
         except Exception:
             pass
         return None
 
-    def _pretty_action(self, op: str, a: Dict) -> str:
-        if op == "navigate":
-            return f"navigate → {a.get('url','')}"
-        if op == "click":
-            target = a.get("ref") or a.get("selector") or "?"
-            return f"click → {target}"
-        if op == "type":
-            target = a.get("ref") or a.get("selector") or "?"
-            text = a.get("text","")
-            return f"type → {target} = '{text}'"
-        if op == "press":
-            return f"press → {a.get('key','Enter')}"
-        if op == "hover":
-            target = a.get("ref") or a.get("selector") or "?"
-            return f"hover → {target}"
-        if op == "wait":
-            return f"wait → {a.get('ms',1000)}ms"
-        return f"{op}"
+    def _nice_action(self, a: Dict) -> str:
+        op = a.get("op","?")
+        if op == "navigate": return f"navigate → {a.get('url','')}"
+        if op == "click":    return f"click → {a.get('ref') or a.get('selector','?')}"
+        if op == "type":     return f"type → {(a.get('ref') or a.get('selector','?'))} = '{a.get('text','')}'"
+        if op == "press":    return f"press → {a.get('key','Enter')}"
+        if op == "wait":     return f"wait → {a.get('ms',800)}ms"
+        if op == "screenshot": return "screenshot"
+        return op
 
-    def _clip(self, text: str, n: int) -> str:
-        if not isinstance(text, str):
-            text = str(text)
-        return text if len(text) <= n else text[:n] + "\n..."
+    def _clip(self, t: str, n: int) -> str:
+        return t if len(t) <= n else t[:n] + "\n..."
 
-    def _status(self, description: str, done: bool = False) -> Dict:
-        return {"event": {"type": "status", "data": {"description": description, "done": done}}}
+    def _extract_goal(self, messages: List[dict]) -> Optional[str]:
+        for m in reversed(messages or []):
+            if m.get("role") == "user" and isinstance(m.get("content"), str):
+                return m["content"]
+        return None
 
-    def _image_event(self, b64img: str) -> Dict:
-        return {"event": {"type": "image", "data": {"mime_type": "image/png", "base64": b64img}}}
 
-    # ----------------------------------------------------------
-    # Intent + goal helpers
-    def _infer_intent(self, message: Optional[str]) -> str:
-        """Heuristically detect whether a prompt is small-talk or navigation work."""
+# ---------------------- OpenWebUI-required module-level entrypoint -----------------
 
-        if not message:
-            return "tool"
+_pipeline_singleton = Pipeline()
 
-        text = message.strip().lower()
-        if not text:
-            return "tool"
-
-        if "http://" in text or "https://" in text:
-            return "tool"
-
-        nav_keywords = (
-            "navigate",
-            "open",
-            "search",
-            "browser",
-            "website",
-            "page",
-            "click",
-            "scroll",
-            "type",
-            "fill",
-            "visit",
-            "go to",
-        )
-        if any(kw in text for kw in nav_keywords):
-            return "tool"
-
-        chat_markers = ("hi", "hello", "hey", "thank", "thanks", "how are")
-        if any(text.startswith(marker) for marker in chat_markers):
-            return "chat"
-
-        if text.endswith("?") and not any(kw in text for kw in nav_keywords):
-            return "chat"
-
-        if len(text.split()) <= 6 and not any(kw in text for kw in nav_keywords):
-            return "chat"
-
-        return "tool"
-
-    def _rewrite_goal(self, goal: str) -> str:
-        """Normalize user instructions and append context from the active session."""
-
-        cleaned = (goal or "").strip()
-        if not cleaned:
-            return ""
-
-        # Collapse internal whitespace so the goal stays compact for the LLM call.
-        cleaned = re.sub(r"\s+", " ", cleaned)
-
-        session = getattr(self, "session", None)
-        context_bits: List[str] = []
-        if session:
-            last_error = getattr(session, "last_error", None)
-            if last_error:
-                context_bits.append(f"Previous error to avoid: {last_error}")
-
-            last_snapshot = getattr(session, "last_snapshot", None)
-            if last_snapshot:
-                context_bits.append("Continue from the current page state; avoid reloading unnecessarily.")
-
-        if context_bits:
-            cleaned = f"{cleaned}. " + " ".join(context_bits)
-
-        return cleaned
+async def pipe(user_message: str = "", model_id: Optional[str] = None,
+               messages: Optional[List[dict]] = None, body: Optional[dict] = None):
+    """
+    OpenWebUI calls this function. It must be an async generator yielding event dicts.
+    """
+    async for event in _pipeline_singleton.pipe(user_message, model_id, messages or [], body or {}):
+        yield event
