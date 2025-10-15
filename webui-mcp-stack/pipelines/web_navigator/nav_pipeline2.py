@@ -1,55 +1,81 @@
 """
 title: Nav Pipeline V3 (Browser bootstrap)
 author: You
-version: 0.1.0
-description: Sync, valves-enabled pipeline that installs MCP Playwright, navigates (e.g., google.com), and returns a screenshot URL + embedded logs.
+version: 1.1.0
+description: External pipeline with awaited hooks fixed, Valves enabled, sync pipe(); installs MCP Playwright, navigates (google.com by default), returns screenshot URL + logs.
 """
 
-from typing import Iterator, List, Optional
+from typing import Iterator, Optional, List
 from pydantic import BaseModel, Field
 import httpx, time, json, re
 
-# NOTE: This is an external Pipelines-server pipeline (NOT a local function).
-# - pipe() MUST be synchronous (def), returning str or Iterator[str].
-# - Define a Valves class so /<id>/valves/spec is available.
+# ──────────────────────────────────────────────────────────────────────────────
+# IMPORTANT NOTES FOR OPEN WEBUI PIPELINES:
+# - External pipelines must expose class Pipeline with a sync pipe() that returns
+#   a str or a *synchronous* generator of str. Async generators are not supported
+#   reliably; stick to sync yields. (See issues/discussions.)  [refs below]
+# - The server *awaits* several optional hooks. If you don't define them,
+#   it may "await None" -> TypeError. Define them as async no-ops.
+# - Define a nested Valves(BaseModel) and set self.valves = self.Valves()
+#   so /<id>/valves/spec returns 200 and the Admin UI can render knobs.
+# - Pipeline id should match what your WebUI calls (e.g., nav_pipelinev3).
+# ──────────────────────────────────────────────────────────────────────────────
 
 class Pipeline:
+    # ----------------------- Valves visible in Admin UI -----------------------
     class Valves(BaseModel):
-        # --- MCP Playwright / static server
+        # MCP Playwright base (your running service that exposes /browser_* endpoints)
         playwright_base: str = Field(
             default="http://91.99.79.208:3880/mcp_playwright",
-            description="Base URL of the MCP Playwright service",
+            description="MCP Playwright base URL"
         )
+        # Public HTTP server that serves image files from img_dir
         screenshot_base: str = Field(
             default="http://91.99.79.208:3888",
-            description="Public base URL serving /tmp/playwright-output",
+            description="Public base URL that serves images from img_dir"
         )
+        # Directory on the MCP host where /browser_take_screenshot writes files
         img_dir: str = Field(
             default="/tmp/playwright-output",
-            description="Server-side path where screenshots are saved",
+            description="Server-side path for screenshots"
+        )
+        # Behavior
+        default_url: str = Field(
+            default="https://www.google.com",
+            description="Fallback URL when none found in user prompt"
+        )
+        max_tool_retries: int = Field(
+            default=5, ge=1, le=10, description="Retries for MCP calls"
+        )
+        show_logs: bool = Field(
+            default=True, description="Append log tail into chat output"
         )
 
-        # --- Behavior
-        max_tool_retries: int = Field(default=5, ge=1, le=10)
-        verbose: bool = Field(default=True, description="Return log tail in chat")
-        default_url: str = Field(default="https://www.google.com", description="Fallback URL")
-
     def __init__(self):
-        # IMPORTANT: Set id to match your UI’s calls (/nav_pipelinev3/valves/spec)
+        # Make the id EXACTLY what WebUI calls (/api/v1/pipelines/nav_pipelinev3/…)
         self.id = "nav_pipelinev3"
         self.name = "Nav Pipeline V3 (Browser bootstrap)"
-        self.type = "pipe"  # default, but explicit is fine
+        self.type = "pipe"
         self.valves = self.Valves()
 
+        # HTTP settings
         self._timeout = httpx.Timeout(60.0, read=60.0, connect=30.0)
 
-    # Optional lifecycle: called when valves updated (exposed via /valves/update)
-    def on_valves_updated(self):
-        # No derived config, but you could validate endpoints here
-        pass
+    # ──────────────── HOOKS the server may AWAIT (define them!) ───────────────
+    async def on_startup(self):
+        # no-op but avoids "await None" TypeError
+        return None
 
-    # --------------------------- helpers ---------------------------
+    async def on_shutdown(self):
+        # no-op but avoids "await None" TypeError
+        return None
 
+    async def on_valves_updated(self):
+        # no-op but avoids "await None" TypeError
+        # You can validate endpoints here if you want.
+        return None
+
+    # ───────────────────────── internal utilities ─────────────────────────────
     def _retry(self, n: int):
         for i in range(n):
             yield i, min(2 ** i * 0.2, 2.0)
@@ -68,49 +94,46 @@ class Pipeline:
         d = re.search(r"\b([a-z0-9\-]+\.[a-z]{2,})(/[^\s]*)?\b", text, flags=re.I)
         if d:
             dom = d.group(0)
-            if not dom.lower().startswith("http"):
-                return "https://" + dom
-            return dom
+            return dom if dom.startswith("http") else "https://" + dom
         if "google" in text.lower():
             return "https://www.google.com"
         return None
 
-    def _screenshot(self, tag: str, valves: Valves, logs: List[str]) -> str:
+    def _screenshot(self, tag: str, V: Valves, logs: List[str]) -> str:
         fn = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", tag) + ".png"
-        path = f"{valves.img_dir.rstrip('/')}/{fn}"
+        path = f"{V.img_dir.rstrip('/')}/{fn}"
         payload = {"fullPage": True, "filename": path}
         try:
-            r = self._post(valves.playwright_base, "/browser_take_screenshot", payload)
+            r = self._post(V.playwright_base, "/browser_take_screenshot", payload)
             logs.append(f"screenshot status={r.status_code} path={path}")
             if r.status_code < 400:
-                return f"{valves.screenshot_base.rstrip('/')}/{fn}?ts={int(time.time()*1000)}"
-            return f"(screenshot_failed status={r.status_code} body={r.text[:200]!r})"
+                return f"{V.screenshot_base.rstrip('/')}/{fn}?ts={int(time.time()*1000)}"
+            return f"(screenshot_failed status={r.status_code} body={r.text[:160]!r})"
         except Exception as e:
-            logs.append(f"screenshot error: {e}")
+            logs.append(f"screenshot exception: {e}")
             return f"(screenshot_exception: {e})"
 
-    # --------------------------- core ---------------------------
-
+    # ─────────────────────────────── core pipe ────────────────────────────────
     def pipe(
         self,
-        body,                  # OpenAIChatCompletionForm (don’t import to avoid hard dep)
+        body,                        # OpenAI-style ChatCompletion body (server schema)
         model_id: Optional[str] = None,
         messages: Optional[list] = None,
         stream: bool = False,
         **kwargs,
     ) -> Iterator[str]:
         """
-        Synchronous generator returning text chunks.
-        This streams a single block at the end (you could yield smaller chunks if you prefer).
+        Synchronous generator that yields plain text.
+        The Pipelines server will stream these chunks back to WebUI.
         """
         V = self.valves
         logs: List[str] = []
+
         def log(msg: str): logs.append(msg)
 
-        # 0) Extract user text
+        # 0) Extract last user message (OpenAI schema)
         try:
             msgs = (messages or body.messages or [])
-            # get last user message content (OpenAI schema)
             user_text = ""
             for m in reversed(msgs):
                 role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else None)
@@ -123,7 +146,10 @@ class Pipeline:
             user_text = ""
             log(f"user_text parse error: {e}")
 
-        # 1) Install/start Playwright
+        # Immediate heartbeat chunk so UI shows something
+        yield "⏳ Starting browser bootstrap…\n"
+
+        # 1) Install/start Playwright (MCP)
         ok_install = False
         for i, backoff in self._retry(V.max_tool_retries):
             try:
@@ -139,10 +165,12 @@ class Pipeline:
 
         if not ok_install:
             msg = "❌ MCP Playwright install failed — check `playwright_base` reachability."
-            if V.verbose:
+            if V.show_logs:
                 msg += "\n\n--- LOGS (tail) ---\n" + "\n".join(logs[-50:])
             yield msg
             return
+
+        yield "🧩 Browser installed.\n"
 
         # 2) Decide URL and navigate
         url = self._extract_url(user_text) or V.default_url
@@ -159,7 +187,7 @@ class Pipeline:
                 log(f"navigate exception: {e}")
                 time.sleep(backoff)
 
-        # 3) Snapshot + Screenshot
+        # 3) Snapshot (best effort) + Screenshot
         snap_txt = ""
         try:
             r = self._post(V.playwright_base, "/browser_snapshot", {})
@@ -167,29 +195,23 @@ class Pipeline:
             if r.status_code < 400:
                 data = r.json()
                 result = data.get("result", data)
-                snap_txt = json.dumps(result)[:1000]
+                snap_txt = json.dumps(result, ensure_ascii=False)[:1200]
         except Exception as e:
             log(f"snapshot exception: {e}")
 
         shot_url = self._screenshot("bootstrap", V, logs)
 
-        # 4) Return a single, friendly message (with logs appended)
+        # 4) Final message (single block)
         out_lines = []
-        if nav_ok:
-            out_lines.append(f"✅ Navigated to: {url}")
-        else:
-            out_lines.append(f"⚠️ Navigate failed to: {url}")
-
+        out_lines.append(f"{'✅' if nav_ok else '⚠️'} Navigated to: {url}")
         if shot_url:
             out_lines.append(f"📸 Screenshot: {shot_url}")
-
         if snap_txt:
             out_lines.append("📖 Snapshot (clipped):")
             out_lines.append("```json")
             out_lines.append(snap_txt)
             out_lines.append("```")
-
-        if V.verbose:
+        if V.show_logs:
             out_lines.append("\n--- LOGS (tail) ---")
             out_lines.extend(logs[-80:])
 
