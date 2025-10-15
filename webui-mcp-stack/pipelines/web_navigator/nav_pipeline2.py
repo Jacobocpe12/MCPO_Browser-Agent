@@ -1,72 +1,17 @@
 """
 title: Browser MOA (Planner + Visual + Verifier)
 author: You
-version: 0.2.0
-description: Multi-agent browser pipeline with Planner + Visual + Verifier, rich logs, and runtime-editable settings (no container restarts).
-# --- Optional schema some OpenWebUI builds read to render a settings panel ---
-# settings:
-#   - id: openai_base
-#     label: OpenAI-Compatible Base URL
-#     type: text
-#     required: false
-#     default: http://localhost:11434
-#   - id: openai_api_key
-#     label: API Key
-#     type: password
-#     default: ""
-#   - id: model_planner
-#     label: Planner Model
-#     type: text
-#     default: gpt-4o-mini
-#   - id: model_verifier
-#     label: Verifier Model
-#     type: text
-#     default: gpt-4o-mini
-#   - id: model_visual
-#     label: Visual Model
-#     type: text
-#     default: gpt-4o-mini
-#   - id: model_summary
-#     label: Summary Model
-#     type: text
-#     default: gpt-4o-mini
-#   - id: playwright_base
-#     label: MCP Playwright Base
-#     type: text
-#     default: http://127.0.0.1:3880/mcp_playwright
-#   - id: screenshot_base
-#     label: Screenshot Public Base
-#     type: text
-#     default: http://127.0.0.1:3888
-#   - id: img_dir
-#     label: Screenshot Save Directory
-#     type: text
-#     default: /tmp/playwright-output
-#   - id: max_tool_retries
-#     label: Max Tool Retries
-#     type: number
-#     default: 5
-#   - id: step_limit
-#     label: Step Limit
-#     type: number
-#     default: 15
-#   - id: log_level
-#     label: Log Level (DEBUG/INFO/WARNING/ERROR)
-#     type: text
-#     default: INFO
-#   - id: debug
-#     label: Debug Mode (1/0)
-#     type: text
-#     default: 0
+version: 0.3.0
+description: Multi-agent browser pipeline with Planner + Visual + Verifier, runtime-editable settings, rich logs, model fallbacks, and URL bootstrap.
 """
 
 import os, time, json, asyncio, httpx, yaml, re, traceback, logging, threading, pathlib
 from typing import Optional, Dict, Any, List, Tuple, AsyncGenerator
+from urllib.parse import urlparse
 
 # =============================== UI Event helpers =================================
 
 def ev_status(desc: str, done: bool=False) -> Dict[str, Any]:
-    # IMPORTANT: use done=True ONLY for the final event
     return {"event": {"type": "status", "data": {"description": desc, "done": done}}}
 
 def ev_msg_md(md: str) -> Dict[str, Any]:
@@ -78,20 +23,27 @@ def ev_log_block(lines: List[str]) -> Dict[str, Any]:
 
 # ================================ Defaults / Schema ================================
 
+# 🔧 Your baked-in defaults (editable at runtime)
 DEFAULTS = {
-    "openai_base":      "http://localhost:11434",
-    "openai_api_key":   "",
+    "openai_base":      "https://ollama.gpu.lfi.rwth-aachen.de/api",
+    "openai_api_key":   "sk-b260ccfd2e994dec9e0575124073ddc8",
     "model_visual":     "gpt-4o-mini",
-    "model_planner":    "gpt-4o-mini",
+    "model_planner":    "azure.gpt-4o-sweden",  # ← you asked for this
     "model_verifier":   "gpt-4o-mini",
     "model_summary":    "gpt-4o-mini",
-    "playwright_base":  "http://127.0.0.1:3880/mcp_playwright",
-    "screenshot_base":  "http://127.0.0.1:3888",
+    "playwright_base":  "http://91.99.79.208:3880/mcp_playwright",
+    "screenshot_base":  "http://91.99.79.208:3888",
     "img_dir":          "/tmp/playwright-output",
     "max_tool_retries": 5,
     "step_limit":       15,
-    "log_level":        "INFO",
-    "debug":            0,
+    "log_level":        "DEBUG",
+    "debug":            1,
+
+    # Optional: model fallbacks to try if the server returns "model not found"
+    "model_fallbacks":  ["gpt-4o", "gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"],
+
+    # Optional: force a first navigation if goal contains a URL/domain
+    "bootstrap_if_url": True,
 }
 
 PERSIST_PATHS = [
@@ -99,6 +51,7 @@ PERSIST_PATHS = [
     os.path.join(os.getcwd(), "browser_moa_pipeline.json"),
 ]
 
+# Chat completions paths to try (server quirks differ)
 CANDIDATE_CHAT_URLS = [
     "/v1/chat/completions",
     "/chat/completions",
@@ -168,6 +121,25 @@ def _safe_snip(s: str, n: int = 300) -> str:
     except Exception:
         return "(unprintable)"
 
+def _strip_api_suffix(base: str) -> str:
+    # If someone sets base like ".../api", also try the parent base
+    if base.endswith("/api"): return base[:-4]  # drop "/api"
+    return base
+
+def _extract_first_url_or_domain(text: str) -> Optional[str]:
+    if not text: return None
+    # Quick URL or domain finder
+    url_match = re.search(r"(https?://[^\s]+)", text, flags=re.I)
+    if url_match: return url_match.group(1)
+    dom_match = re.search(r"\b([a-z0-9\-]+\.[a-z]{2,})(/[^\s]*)?\b", text, flags=re.I)
+    if dom_match:
+        dom = dom_match.group(0)
+        # common cases: google.com (no scheme)
+        if not dom.lower().startswith("http"):
+            return "https://" + dom
+        return dom
+    return None
+
 # =============================== In-UI Log Buffer =================================
 
 class UILogger:
@@ -217,8 +189,6 @@ class ConfigManager:
         self._cfg = DEFAULTS.copy()
         self.log = logger
         self._load_persisted()
-        # Env vars override persisted (optional; comment out if not desired)
-        self._merge_env()
 
     @property
     def cfg(self) -> Dict[str, Any]:
@@ -251,41 +221,8 @@ class ConfigManager:
         if last_err:
             raise last_err
 
-    def _merge_env(self):
-        # Only merge if env var present; no defaults here
-        mapping = {
-            "OPENAI_BASE": "openai_base",
-            "OPENAI_API_KEY": "openai_api_key",
-            "MODEL_VISUAL": "model_visual",
-            "MODEL_PLANNER": "model_planner",
-            "MODEL_VERIFIER": "model_verifier",
-            "MODEL_SUMMARY": "model_summary",
-            "PLAYWRIGHT_BASE": "playwright_base",
-            "SCREENSHOT_BASE": "screenshot_base",
-            "IMG_DIR": "img_dir",
-            "MAX_TOOL_RETRIES": "max_tool_retries",
-            "STEP_LIMIT": "step_limit",
-            "LOG_LEVEL": "log_level",
-            "DEBUG": "debug",
-        }
-        for env, key in mapping.items():
-            if env in os.environ and os.environ[env] != "":
-                v = os.environ[env]
-                if key in ("max_tool_retries", "step_limit", "debug"):
-                    try: v = int(v)
-                    except: pass
-                self._cfg[key] = v
-        self.log.add("merged env overrides (if any)")
-
     def merge_ui(self, body: Dict[str, Any], user_text: str):
-        """
-        Merge settings from the OpenWebUI UI (body payload) and from chat-side commands.
-        Supported sources:
-          body.pipeline.config, body.config, body.kwargs, body.settings, body.params, body.variables
-          "!set key=value" lines in user_text
-          "!config {json}"
-        """
-        # 1) Body payloads (various names used by different builds)
+        # Merge from multiple possible body shapes
         def _dig(*keys):
             c = body or {}
             for k in keys:
@@ -309,7 +246,7 @@ class ConfigManager:
             self._cfg.update(self._coerce_types(merged_from_body))
             self.log.add_kv("config.merge_from_ui_body", self._redacted_subset(merged_from_body))
 
-        # 2) Chat-side: "!set key=value" lines
+        # Chat-side: !set key=value
         if user_text and "!set" in user_text:
             for line in user_text.splitlines():
                 if line.strip().startswith("!set "):
@@ -323,7 +260,7 @@ class ConfigManager:
                     except Exception as e:
                         self.log.add(f"set parse error: {e}")
 
-        # 3) Chat-side: "!config {json}"
+        # Chat-side: !config {json}
         if user_text and "!config" in user_text:
             try:
                 i = user_text.index("!config")
@@ -354,6 +291,8 @@ class ConfigManager:
         if k in ("max_tool_retries", "step_limit", "debug"):
             try: return int(v)
             except: return v
+        if k == "model_fallbacks" and isinstance(v, str):
+            return [x.strip() for x in v.split(",") if x.strip()]
         return v
 
     def _redacted_subset(self, d: Dict[str, Any]) -> Dict[str, Any]:
@@ -362,12 +301,55 @@ class ConfigManager:
             red["openai_api_key"] = _redact(str(red["openai_api_key"]))
         return red
 
+    def _redact_val(self, k: str, v: Any) -> str:
+        return _redact(v) if "key" in k else str(v)
+
     def pretty(self) -> str:
         show = dict(self._cfg)
         show["openai_api_key"] = _redact(show.get("openai_api_key"))
         return json.dumps(show, indent=2)
 
 # ================================ Browser Tool ===================================
+
+class UILogger:
+    def __init__(self, flush_every: int = 10, to_stdout: bool = False, level: str = "INFO"):
+        self._lines: List[str] = []
+        self._idx_flushed = 0
+        self._lock = threading.Lock()
+        self._flush_every = max(flush_every, 1)
+        self._to_stdout = to_stdout
+        self.level = getattr(logging, level.upper(), logging.INFO)
+        logging.basicConfig(level=self.level)
+
+    def add(self, msg: str):
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        with self._lock:
+            self._lines.append(line)
+            if self._to_stdout:
+                print(line, flush=True)
+
+    def add_kv(self, key: str, val: Any):
+        try:
+            s = json.dumps(val, ensure_ascii=False) if not isinstance(val, str) else val
+        except Exception:
+            s = str(val)
+        self.add(f"{key} = {s}")
+
+    def need_flush(self) -> bool:
+        with self._lock:
+            return len(self._lines) - self._idx_flushed >= self._flush_every
+
+    def flush_events(self, force: bool=False) -> List[Dict[str, Any]]:
+        with self._lock:
+            if not force and not self.need_flush():
+                return []
+            chunk = self._lines[self._idx_flushed:]
+            self._idx_flushed = len(self._lines)
+        return [ev_log_block(chunk)] if chunk else []
+
+    def all_events(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [ev_log_block(self._lines[:])]
 
 class BrowserTool:
     def __init__(self, base: str, img_dir: str, screenshot_base: str, retries: int, logger: UILogger):
@@ -524,74 +506,92 @@ class BrowserTool:
 
 # ================================ LLM Wrapper =====================================
 
+def _candidate_urls_for_base(base: str) -> List[str]:
+    base = _canon_base(base)
+    strip_base = _strip_api_suffix(base)
+    urls = [base + path for path in CANDIDATE_CHAT_URLS]
+    if strip_base != base:
+        # also try without trailing /api
+        urls += [strip_base + path for path in CANDIDATE_CHAT_URLS]
+    # de-duplicate while preserving order
+    seen, out = set(), []
+    for u in urls:
+        if u not in seen:
+            out.append(u); seen.add(u)
+    return out
+
 async def chat_complete(messages: List[Dict], model: str, base: str, api_key: str,
-                        logger: UILogger, expect_json: bool=False) -> str:
-    payload = {"model": model, "messages": messages, "stream": False}
+                        logger: UILogger, expect_json: bool=False,
+                        fallbacks: Optional[List[str]] = None) -> str:
+    """
+    Tries multiple endpoint paths and (optionally) model fallbacks if the server complains
+    about an unknown model.
+    """
+    payload_base = {"messages": messages, "stream": False}
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
-    base = _canon_base(base)
-    candidates = [base + path for path in CANDIDATE_CHAT_URLS]
-    logger.add_kv("chat_complete.request", {"model": model, "candidates": candidates, "msg_count": len(messages)})
+    candidates = _candidate_urls_for_base(base)
+    try_models = [model] + [m for m in (fallbacks or []) if m != model]
+
+    logger.add_kv("chat_complete.request", {
+        "models": try_models, "candidates": candidates, "msg_count": len(messages)
+    })
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(90, read=90, connect=30)) as http:
         last_error = None
-        for url in candidates:
-            try:
-                logger.add(f"POST {url}")
-                r = await http.post(url, json=payload, headers=headers)
-                logger.add(f"→ status={r.status_code}")
-                if r.status_code >= 400:
-                    logger.add(f"← err_snip={_safe_snip(r.text)}")
+        for model_name in try_models:
+            payload = dict(payload_base, model=model_name)
+            for url in candidates:
+                try:
+                    logger.add(f"POST {url} (model={model_name})")
+                    r = await http.post(url, json=payload, headers=headers)
+                    logger.add(f"→ status={r.status_code}")
+                    txt = r.text or ""
+                    if r.status_code >= 400:
+                        logger.add(f"← err_snip={_safe_snip(txt)}")
+                        # If model is not available, try the next model
+                        if "model" in txt.lower() and "not" in txt.lower():
+                            logger.add("suspect model-not-found; trying next model if available")
+                            break  # try next model_name
+                        continue  # try next url path with same model
+                    data = r.json()
+                    out = data["choices"][0]["message"]["content"]
+                    logger.add(f"chat_complete.ok snippet={_safe_snip(out)}")
+                    if expect_json:
+                        s, e = out.find("{"), out.rfind("}")
+                        if s != -1 and e != -1 and e > s:
+                            j = out[s:e+1]
+                            logger.add(f"chat_complete.json_snip={_safe_snip(j)}")
+                            return j
+                        logger.add("chat_complete.expect_json but no braces found; returning raw content")
+                    return out
+                except Exception as e:
+                    last_error = e
+                    logger.add(f"chat_complete error on {url} (model={model_name}): {e}")
                     continue
-                data = r.json()
-                out = data["choices"][0]["message"]["content"]
-                logger.add(f"chat_complete.ok snippet={_safe_snip(out)}")
-                if expect_json:
-                    s, e = out.find("{"), out.rfind("}")
-                    if s != -1 and e != -1 and e > s:
-                        j = out[s:e+1]
-                        logger.add(f"chat_complete.json_snip={_safe_snip(j)}")
-                        return j
-                    logger.add("chat_complete.expect_json but no braces found; returning raw content")
-                return out
-            except Exception as e:
-                last_error = e
-                logger.add(f"chat_complete error on {url}: {e}")
-                continue
-        raise RuntimeError(f"chat_complete failed against all candidates: {last_error}")
+        raise RuntimeError(f"chat_complete failed: last_error={last_error}")
 
 # ================================== Pipeline ======================================
 
 class Pipeline:
     def __init__(self):
-        # Create a logger early so config loading can log
-        self.log = UILogger(flush_every=10, to_stdout=False, level="INFO")
+        self.log = UILogger(flush_every=5, to_stdout=False, level=DEFAULTS["log_level"])
         self.cfgm = ConfigManager(self.log)
-        # Recreate logger with chosen level
-        self.log = UILogger(
-            flush_every=10,
-            to_stdout=False,
-            level=self.cfgm.cfg.get("log_level", "INFO"),
-        )
-        self.cfgm.log = self.log  # reattach
-
         self.session: Dict[str, Any] = {
             "goal": None,
             "last_snapshot": None,
             "step_log": [],
             "visual_last": None
         }
-        # Browser constructed later after config is merged (in pipe())
+        self.browser: Optional[BrowserTool] = None
 
     async def pipe(self, user_message: str, model_id: Optional[str], messages: List[dict], body: dict) -> AsyncGenerator[Dict[str, Any], None]:
         yield ev_status("🚀 Browser MOA pipeline starting…", done=False)
-
-        # Merge UI/chat configuration at the start of every run
         self.cfgm.merge_ui(body or {}, user_message or "")
         cfg = self.cfgm.cfg
 
-        # Refresh logger level & browser after config merge
-        self.log = UILogger(flush_every=10, to_stdout=False, level=cfg.get("log_level", "INFO"))
+        # (re)init logger with current level
+        self.log = UILogger(flush_every=5, to_stdout=False, level=cfg.get("log_level", "INFO"))
         self.cfgm.log = self.log
 
         self.browser = BrowserTool(
@@ -602,43 +602,25 @@ class Pipeline:
             logger=self.log,
         )
 
-        self.log.add_kv("config.active", {"openai_base": cfg["openai_base"], "openai_api_key": _redact(cfg["openai_api_key"]),
-                                          "models": {"planner": cfg["model_planner"], "verifier": cfg["model_verifier"], "visual": cfg["model_visual"], "summary": cfg["model_summary"]},
-                                          "playwright_base": cfg["playwright_base"], "screenshot_base": cfg["screenshot_base"]})
+        self.log.add_kv("config.active", {
+            "openai_base": cfg["openai_base"],
+            "openai_api_key": _redact(cfg["openai_api_key"]),
+            "models": {
+                "planner": cfg["model_planner"],
+                "verifier": cfg["model_verifier"],
+                "visual": cfg["model_visual"],
+                "summary": cfg["model_summary"],
+            },
+            "playwright_base": cfg["playwright_base"],
+            "screenshot_base": cfg["screenshot_base"],
+        })
         for ev in self.log.flush_events(force=True): yield ev
 
-        # Quick help UI for config (first time or when keys/base are blank)
-        if not cfg["openai_base"] or cfg["openai_base"].startswith("http://localhost"):
-            yield ev_msg_md(
-                "**Settings Tip**\n\n"
-                "You can configure settings without restarts:\n\n"
-                "• **Pipeline Settings Panel** (if visible in your OpenWebUI)\n"
-                "• **Chat commands**:\n"
-                "  - `!set openai_base=https://api.openai.com/v1`  \n"
-                "  - `!set openai_api_key=sk-...`  \n"
-                "  - `!set model_planner=gpt-4o-mini`  \n"
-                "  - `!set playwright_base=http://HOST:3880/mcp_playwright`  \n"
-                "  - `!set screenshot_base=http://HOST:3888`  \n"
-                "  - `!save` to persist\n\n"
-                "Or paste a JSON block:\n"
-                "```json\n!config {\n"
-                f'  "openai_base": "{cfg["openai_base"]}",\n'
-                '  "openai_api_key": "sk-...REDACTED...",\n'
-                f'  "model_planner": "{cfg["model_planner"]}",\n'
-                f'  "model_verifier": "{cfg["model_verifier"]}",\n'
-                f'  "model_visual": "{cfg["model_visual"]}",\n'
-                f'  "model_summary": "{cfg["model_summary"]}",\n'
-                f'  "playwright_base": "{cfg["playwright_base"]}",\n'
-                f'  "screenshot_base": "{cfg["screenshot_base"]}",\n'
-                f'  "img_dir": "{cfg["img_dir"]}"\n'
-                "}\n```"
-            )
-
-        # Handle quick commands that act immediately
+        # Quick commands
         if user_message and user_message.strip().lower() in ("!save", "!persist"):
             try:
                 self.cfgm.save()
-                yield ev_msg_md("✅ **Settings saved.** Next runs will use these values.")
+                yield ev_msg_md("✅ **Settings saved.**")
             except Exception as e:
                 yield ev_msg_md(f"❌ **Save failed:** `{e}`")
             for ev in self.log.flush_events(force=True): yield ev
@@ -652,7 +634,7 @@ class Pipeline:
             return
 
         try:
-            # 0) Connectivity probe for the chat backend (fast fail w/ guidance)
+            # Connectivity probe for chat backend
             try:
                 _ = await chat_complete(
                     messages=[{"role": "user", "content": "ping"}],
@@ -660,7 +642,8 @@ class Pipeline:
                     base=cfg["openai_base"],
                     api_key=cfg["openai_api_key"],
                     logger=self.log,
-                    expect_json=False
+                    expect_json=False,
+                    fallbacks=cfg.get("model_fallbacks", []),
                 )
                 self.log.add("chat backend probe ok")
             except Exception as e:
@@ -669,7 +652,7 @@ class Pipeline:
                     "❌ **Chat backend not reachable or misconfigured.**\n\n"
                     f"- Base: `{cfg['openai_base']}`\n"
                     f"- Key: `{_redact(cfg['openai_api_key'])}`\n\n"
-                    "Use `!set openai_base=...` and `!set openai_api_key=...`, then `!save` (optional) and rerun."
+                    "Fix with `!set openai_base=...` and `!set openai_api_key=...`, then `!save` (optional) and rerun."
                 )
                 for ev in self.log.all_events(): yield ev
                 yield ev_status("✅ Finished.", done=True)
@@ -687,17 +670,18 @@ class Pipeline:
                 yield ev_status("❌ Empty goal received — stopping.", done=True)
                 return
 
+            # Verifier
             try:
                 decision_json = await chat_complete(
                     [{"role": "system", "content": SYS_VERIFIER},
                      {"role": "user", "content": raw_goal}],
                     cfg["model_verifier"], base=cfg["openai_base"], api_key=cfg["openai_api_key"],
-                    logger=self.log, expect_json=True
+                    logger=self.log, expect_json=True, fallbacks=cfg.get("model_fallbacks", [])
                 )
                 decision = json.loads(decision_json)
                 self.log.add_kv("verifier.decision", decision)
             except Exception as e:
-                self.log.add(f"verifier error: {e} — falling back to defaults")
+                self.log.add(f"verifier error: {e} — defaulting to use_pipeline=True")
                 decision = {"use_pipeline": True, "goal": raw_goal, "intent": "unknown", "targets": []}
 
             use_pipeline = bool(decision.get("use_pipeline", False))
@@ -707,23 +691,17 @@ class Pipeline:
             for ev in self.log.flush_events(): yield ev
 
             if not use_pipeline:
-                self.log.add("verifier says no pipeline")
-                for ev in self.log.flush_events(force=True): yield ev
                 yield ev_status("💬 Verifier: pipeline not required.", done=False)
                 yield ev_msg_md("This query doesn't require browser actions.")
+                for ev in self.log.flush_events(force=True): yield ev
                 yield ev_status("✅ Finished.", done=True)
                 return
 
             self.session["goal"] = goal
             yield ev_status(f"🧭 Pipeline activated for goal: {goal}", done=False)
 
-            # 2) Start session / install browser
+            # 2) Install/start browser
             yield ev_status("🧩 Installing/starting browser…", done=False)
-            self.browser.base = cfg["playwright_base"]
-            self.browser.img_dir = cfg["img_dir"]
-            self.browser.screenshot_base = cfg["screenshot_base"]
-            self.browser.retries = int(cfg["max_tool_retries"])
-
             ok, msg = await asyncio.to_thread(self.browser.install)
             self.log.add_kv("install.result", {"ok": ok, "msg": msg})
             yield ev_status(f"🧩 {msg}", done=False)
@@ -734,7 +712,27 @@ class Pipeline:
                 yield ev_status("✅ Finished.", done=True)
                 return
 
-            # 3) Main loop
+            # 3) **Bootstrap navigation** if goal contains URL/domain
+            if cfg.get("bootstrap_if_url", True):
+                url_guess = _extract_first_url_or_domain(goal)
+                if url_guess:
+                    self.log.add(f"bootstrap.navigate {url_guess}")
+                    yield ev_status(f"🌐 Navigating (bootstrap) → {url_guess}", done=False)
+                    nav_ok, nav_msg = await asyncio.to_thread(self.browser.navigate, url_guess)
+                    self.log.add_kv("bootstrap.navigate.result", {"ok": nav_ok, "msg": nav_msg})
+                    if not nav_ok:
+                        yield ev_msg_md(f"⚠️ Bootstrap navigate failed: `{nav_msg}`")
+                    # snapshot/screenshot after bootstrap
+                    snap_ok, snapshot = await asyncio.to_thread(self.browser.snapshot)
+                    if snap_ok:
+                        self.session["last_snapshot"] = snapshot
+                        yield ev_msg_md("📖 **Snapshot (YAML, clipped)**\n\n```\n" + self._clip(snapshot, 1200) + "\n```")
+                    shot_ok, url_or_err = await asyncio.to_thread(self.browser.screenshot, f"bootstrap_{int(time.time())}")
+                    if shot_ok:
+                        yield ev_msg_md(f"📸 **View (bootstrap):**\n\n![frame]({url_or_err})")
+                    for ev in self.log.flush_events(): yield ev
+
+            # 4) Planner loop
             for step in range(1, int(cfg["step_limit"]) + 1):
                 self.log.add(f"loop.step {step} begin")
                 obs_text = self._observation_text()
@@ -745,7 +743,7 @@ class Pipeline:
                         [{"role":"system","content":SYS_PLANNER},
                          {"role":"user","content":f"GOAL:\n{goal}\n\nOBSERVATION:\n{obs_text}"}],
                         cfg["model_planner"], base=cfg["openai_base"], api_key=cfg["openai_api_key"],
-                        logger=self.log, expect_json=True
+                        logger=self.log, expect_json=True, fallbacks=cfg.get("model_fallbacks", [])
                     )
                 except Exception as e:
                     self.log.add(f"planner request failed: {e}")
@@ -777,36 +775,30 @@ class Pipeline:
                     self.session["step_log"].append(f"⚠️ {exec_msg}")
                     yield ev_status(f"⚠️ {exec_msg} (retrying may occur)", done=False)
 
-                # Snapshot + Screenshot + parallel visual analysis
+                # Snapshot + Screenshot
                 snap_ok, snapshot = await asyncio.to_thread(self.browser.snapshot)
-                self.log.add_kv("snapshot.ok", snap_ok)
                 if snap_ok:
                     self.session["last_snapshot"] = snapshot
-                    clipped = self._clip(snapshot, 1200)
-                    yield ev_msg_md("📖 **Snapshot (YAML, clipped)**\n\n```\n" + clipped + "\n```")
+                    yield ev_msg_md("📖 **Snapshot (YAML, clipped)**\n\n```\n" + self._clip(snapshot, 1200) + "\n```")
 
                 shot_ok, url_or_err = await asyncio.to_thread(self.browser.screenshot, f"step_{step}_{int(time.time())}")
-                self.log.add_kv("screenshot.ok", shot_ok)
                 if shot_ok:
-                    shot_url = url_or_err
-                    yield ev_msg_md(f"📸 **View after step {step}:**\n\n![frame]({shot_url})")
-                    # Launch visual analysis in parallel
-                    asyncio.create_task(self._run_visual(shot_url, self.session.get("last_snapshot"), cfg))
+                    yield ev_msg_md(f"📸 **View after step {step}:**\n\n![frame]({url_or_err})")
                 else:
                     yield ev_status("⚠️ Screenshot failed", done=False)
 
-                # Keep logs flowing to avoid "silent" sessions
+                # Keep logs flowing
                 for ev in self.log.flush_events(): yield ev
                 yield ev_status(f"⏳ heartbeat after step {step}", done=False)
 
-            # 4) Final summary
+            # 5) Final summary
             yield ev_status("📦 Summarizing…", done=False)
             try:
                 final_summary = await chat_complete(
                     [{"role":"system","content":SYS_SUMMARY},
                      {"role":"user","content":self._summary_prompt()}],
                     cfg["model_summary"], base=cfg["openai_base"], api_key=cfg["openai_api_key"],
-                    logger=self.log, expect_json=False
+                    logger=self.log, expect_json=False, fallbacks=cfg.get("model_fallbacks", [])
                 )
                 yield ev_msg_md(final_summary)
             except Exception as e:
@@ -842,23 +834,6 @@ class Pipeline:
         if op == "screenshot":
             return self.browser.screenshot(f"manual_{int(time.time())}")
         return False, f"unknown_op:{op}"
-
-    async def _run_visual(self, shot_url: str, snapshot: Optional[str], cfg: Dict[str, Any]):
-        obs = f"SCREENSHOT_URL: {shot_url}\n\nSNAPSHOT_YAML:\n{self._clip(snapshot or '', 4000)}"
-        try:
-            out = await chat_complete(
-                [{"role": "system", "content": SYS_VISUAL},
-                 {"role": "user", "content": obs}],
-                cfg["model_visual"], base=cfg["openai_base"], api_key=cfg["openai_api_key"],
-                logger=self.log, expect_json=True
-            )
-            parsed = json.loads(out)
-        except Exception as e:
-            self.log.add(f"visual analysis error: {e}")
-            parsed = {"view": "unknown", "center": None, "zoom": None,
-                      "notable_elements": [], "obstacles": []}
-        self.session["visual_last"] = parsed
-        self.log.add_kv("visual.last", parsed)
 
     def _observation_text(self) -> str:
         parts = []
@@ -907,8 +882,5 @@ _pipeline_singleton = Pipeline()
 
 async def pipe(user_message: str = "", model_id: Optional[str] = None,
                messages: Optional[List[dict]] = None, body: Optional[dict] = None):
-    """
-    OpenWebUI calls this function. It must be an async generator yielding event dicts.
-    """
     async for event in _pipeline_singleton.pipe(user_message, model_id, messages or [], body or {}):
         yield event
