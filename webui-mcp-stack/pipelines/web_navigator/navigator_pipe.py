@@ -25,8 +25,11 @@ class Pipeline:
         self.author = "Jorge Enrique + ChatGPT"
         self.debug = False
 
-        # 🔗 Direct MCPO URL (no env knobs)
-        self.MCPO_BASE_URL = "http://91.99.79.208:3880/mcp_playwright"
+        # 🔗 Direct MCPO URL (override with MCPO_BASE_URL env var). Include the
+        # MCPO server slug (e.g. /mcp_playwright or /mcp_tars) so requests reach
+        # the intended upstream MCP service.
+        default_base = os.getenv("MCPO_BASE_URL", "http://mcpo:3879/mcp_playwright")
+        self.MCPO_BASE_URL = default_base.rstrip("/")
         self.POLL_INTERVAL = 1.5
         self.MAX_WAIT_SEC = 900
         self.LOCAL_IMG_DIR = "/tmp/playwright-output"
