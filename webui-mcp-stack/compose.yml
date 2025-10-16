@@ -76,6 +76,9 @@ services:
       - vision-fusion-mcp
     volumes:
       - ./mcpo:/config
+      - /srv/exports:/exports:ro
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
