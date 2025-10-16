@@ -8,9 +8,9 @@
       "type": "streamable-http",
       "url": "http://ui-tars-mcp:8000/mcp"
     },
-    "mcp_openai_ocr": {
-      "command": "node",
-      "args": ["/opt/openai-ocr-mcp/dist/ocr.js"]
+    "mcp_vision_fusion": {
+      "type": "streamable-http",
+      "url": "http://vision-fusion-mcp:8500/mcp"
     }
   }
 }
