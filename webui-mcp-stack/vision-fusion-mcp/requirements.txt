@@ -1,0 +1,4 @@
+openai>=1.40.0
+flask
+pytesseract
+pillow
