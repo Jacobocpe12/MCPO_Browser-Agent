@@ -24,7 +24,7 @@ services:
         "--caps=vision,pdf,install"
       ]
     volumes:
-      - ./exports:/tmp/playwright-output
+      - /srv/exports:/tmp/playwright-output
     networks:
       - mcpnet
     restart: unless-stopped
@@ -114,7 +114,7 @@ services:
     depends_on:
       - playwright-mcp
     volumes:
-      - ./exports:/usr/share/nginx/html:ro
+      - /srv/exports:/usr/share/nginx/html:ro
     ports:
       - "3888:80"
     networks:
