@@ -26,84 +26,15 @@ def _perform_ocr(image_path: str) -> str:
         return pytesseract.image_to_string(image, lang="eng+deu")
 
 
-def _extract_action(data: Dict[str, Any]) -> Optional[str]:
-    """Return the requested action name from multiple possible payload shapes."""
-
-    keys = ("tool", "tool_name", "command", "action")
-    for key in keys:
-        value = data.get(key)
-        if isinstance(value, str) and value:
-            return value
-
-    type_field = data.get("type")
-    if isinstance(type_field, str) and type_field:
-        return type_field
-
-    # Some clients send {"name": ..., "arguments": {...}}
-    name = data.get("name")
-    if isinstance(name, str) and name:
-        return name
-
-    return None
-
-
-def _extract_arguments(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Pull out arguments from the payload regardless of nesting conventions."""
-
-    if isinstance(data.get("arguments"), dict):
-        return data["arguments"]
-
-    if isinstance(data.get("args"), dict):
-        return data["args"]
-
-    if isinstance(data.get("input"), dict):
-        return data["input"]
-
-    return {}
-
-
-def _list_tools_response() -> Any:
-    """Return the static MCP tool manifest."""
-
-    return jsonify(
-        {
-            "tools": [
-                {
-                    "name": "analyze_image",
-                    "description": "Perform OCR and visual reasoning on an image.",
-                    "parameters": {"image_path": "string"},
-                    "returns": {
-                        "ocr_text": "string",
-                        "vision_analysis": "string",
-                    },
-                }
-            ]
-        }
-    )
-
-
 @app.post("/mcp")
 def mcp_entry() -> Any:
     """Entry point that dispatches MCP tool calls based on the request payload."""
-
     data: Dict[str, Any] = request.get_json(force=True, silent=True) or {}
-    action = _extract_action(data)
+    tool = data.get("tool")
+    args: Dict[str, Any] = data.get("arguments", {})
 
-    if not action:
-        # Default to a health response so discovery pings don't fail the client.
-        return jsonify({"status": "ok", "message": "vision-fusion-mcp ready"})
-
-    normalized_action = action.lower()
-
-    if normalized_action in {"ping", "health", "status"}:
-        return jsonify({"status": "ok"})
-
-    if normalized_action in {"tools/list", "list_tools"}:
-        return _list_tools_response()
-
-    if normalized_action == "analyze_image":
-        args = _extract_arguments(data)
-        image_path = args.get("image_path") or args.get("path")
+    if tool == "analyze_image":
+        image_path = args.get("image_path")
         if not image_path or not os.path.exists(image_path):
             return (
                 jsonify({"error": f"Image not found: {image_path}"}),
@@ -144,23 +75,29 @@ def mcp_entry() -> Any:
         )
 
         answer = (result.choices[0].message.content or "").strip()
+        return jsonify({
+            "ocr_text": ocr_text,
+            "vision_analysis": answer,
+        })
+
+    if tool == "tools/list":
         return jsonify(
             {
-                "ocr_text": ocr_text,
-                "vision_analysis": answer,
+                "tools": [
+                    {
+                        "name": "analyze_image",
+                        "description": "Perform OCR and visual reasoning on an image.",
+                        "parameters": {"image_path": "string"},
+                        "returns": {
+                            "ocr_text": "string",
+                            "vision_analysis": "string",
+                        },
+                    }
+                ]
             }
         )
 
-    return (
-        jsonify(
-            {
-                "error": "Unknown action",
-                "received": action,
-                "supported": ["tools/list", "analyze_image"],
-            }
-        ),
-        400,
-    )
+    return jsonify({"error": "Unknown tool"}), 400
 
 
 if __name__ == "__main__":
