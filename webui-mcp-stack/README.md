@@ -9,7 +9,8 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
 | ------- | ------- |
 | **Playwright MCP** | Provides browser automation with Playwright. Configured with vision, PDF, and install capabilities, and writes artifacts to the shared `exports/` folder. |
 | **UI-TARS MCP** | Node-based vision and interaction MCP server that leverages Google Chrome for UI automation. |
-| **MCPO Hub** | Aggregates the two MCP servers and exposes a single endpoint for OpenWebUI or other MCP-compatible clients. |
+| **OpenAI OCR MCP** | STDIO-based OCR service from [`cjus/openai-ocr-mcp`](https://github.com/cjus/openai-ocr-mcp) compiled into the MCPO container. Reads images from `/exports` and extracts text using OpenAI vision models. |
+| **MCPO Hub** | Aggregates the MCP servers and exposes a single endpoint for OpenWebUI or other MCP-compatible clients. |
 | **OpenWebUI Pipelines** | Hosts custom pipelines—including `web_navigator`—and exposes them to OpenWebUI over HTTP. |
 | **Screenshot Viewer** | Serves files from the shared `exports/` directory via HTTP so captured images can be accessed in a browser. |
 
@@ -52,7 +53,7 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
 
 ### How MCPO is configured
 
-The MCPO container now runs in **config-only** mode so it can attach to the already running Playwright and TARS MCP servers without extra CLI flags. The bundled [`mcpo/config.json`](./mcpo/config.json) uses the required hyphenated `streamable-http` type and advertises both endpoints:
+The MCPO container now runs in **config-only** mode so it can attach to the already running Playwright and TARS MCP servers while spawning the bundled OpenAI OCR MCP binary via stdio. The bundled [`mcpo/config.json`](./mcpo/config.json) advertises all endpoints:
 
 ```json
 {
@@ -64,6 +65,10 @@ The MCPO container now runs in **config-only** mode so it can attach to the alre
     "mcp_tars": {
       "type": "streamable-http",
       "url": "http://ui-tars-mcp:8000/mcp"
+    },
+    "mcp_openai_ocr": {
+      "command": "node",
+      "args": ["/opt/openai-ocr-mcp/dist/ocr.js"]
     }
   }
 }
@@ -76,6 +81,10 @@ mcpo --config /config/config.json --host 0.0.0.0 --port 3879
 ```
 
 This avoids the `TypeError: 'NoneType' object is not subscriptable` crash that occurred when mixing `--server-type` CLI arguments with the JSON configuration.
+
+### OpenAI OCR MCP service
+
+The MCPO image now vendors the [`openai-ocr-mcp`](https://github.com/cjus/openai-ocr-mcp) project inside the container and exposes it as a stdio MCP server. MCPO spawns the compiled Node binary directly, so there is no separate OCR container to manage. The service inherits upstream behavior: it validates image paths, performs OCR via OpenAI's vision API, stores extracted text alongside the input image, and offers an `append_analysis` helper for augmenting the generated files. Point MCP-aware clients at the `mcp_openai_ocr` tool namespace when invoking it from OpenWebUI or other orchestrators. For Codex-style orchestrators, reuse the upstream-aligned system prompt stored at [`mcpo/openai-ocr-mcp/CODEX_PROMPT.md`](./mcpo/openai-ocr-mcp/CODEX_PROMPT.md).
 
 ### Adding the `web_navigator` pipeline
 

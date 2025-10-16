@@ -51,7 +51,7 @@ services:
     networks:
       - mcpnet
     restart: unless-stopped
-    
+
   mcpo:
     build:
       context: ./mcpo
@@ -62,6 +62,9 @@ services:
       - ui-tars-mcp
     volumes:
       - ./mcpo:/config
+      - /srv/exports:/exports:ro
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
@@ -76,6 +79,10 @@ services:
               "mcp_tars": {
                 "type": "streamable-http",
                 "url": "http://ui-tars-mcp:8000/mcp"
+              },
+              "mcp_openai_ocr": {
+                "command": "node",
+                "args": ["/opt/openai-ocr-mcp/dist/ocr.js"]
               }
             }
           }' > /config/config.json;
