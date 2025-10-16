@@ -7,7 +7,6 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
 
 | Service | Purpose |
 | ------- | ------- |
-| **Caddy reverse proxy** | Terminates TLS, issues Let's Encrypt certificates, and routes public hostnames to the internal services. |
 | **Playwright MCP** | Provides browser automation with Playwright. Configured with vision, PDF, and install capabilities, and writes artifacts to the shared `exports/` folder. |
 | **UI-TARS MCP** | Node-based vision and interaction MCP server that leverages Google Chrome for UI automation. |
 | **MCPO Hub** | Aggregates the two MCP servers and exposes a single endpoint for OpenWebUI or other MCP-compatible clients. |
@@ -19,7 +18,6 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
 * Docker
 * Docker Compose v2
 * A Docker network named `mcpnet` (create it once with `docker network create mcpnet`)
-* DNS records for the hostnames you intend to publish (e.g. `mcpo.choype.com`, `shots.choype.com`, `pipelines.choype.com`) pointing to your server
 
 ## Usage
 
@@ -28,17 +26,7 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
    git clone <your-repo-url>
    cd webui-mcp-stack
    ```
-2. Copy the example environment file and edit it to match your deployment:
-   ```bash
-   cp .env.example .env
-   # Update PUBLIC_URL_BASE/MCPO_BASE_URL/MCPO_HOST_BIND/etc. to match your host
-   ```
-   The stack now binds service ports to `127.0.0.1` by default, so external access
-   must go through the bundled Caddy reverse proxy (or another proxy of your choice).
-   Adjust the `*_HOST_BIND` values only if you intentionally want to publish ports
-   directly. Set `MCPO_DOMAIN`, `SHOTS_DOMAIN`, `PIPELINES_DOMAIN`, and
-   `CADDY_ACME_EMAIL` so the proxy can request certificates for the correct hosts.
-3. (One time) clone the OpenWebUI Pipelines repository and sync the custom pipeline:
+2. (One time) clone the OpenWebUI Pipelines repository and sync the custom pipeline:
    ```bash
    git clone https://github.com/open-webui/pipelines.git ./pipelines-upstream
    mkdir -p /data/pipelines
@@ -46,24 +34,20 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
    rsync -av ./pipelines/web_navigator/ /data/pipelines/pipelines/web_navigator/
    ```
    Alternatively set `PIPELINES_PATH` to point at any writable directory that already contains the upstream Pipelines project.
-4. Start the stack (the first run builds the patched MCPO image):
+3. Start the stack (the first run builds the patched MCPO image):
    ```bash
    docker compose up --build -d
    ```
-5. Capture the generated tool API key from `./mcpo/tool_api_key` (or provide
-   your own via the `TOOL_API_KEY` environment variable). The `/tool/public_file`
-   endpoint now requires the key in an `X-API-Key` header.
-6. Connect OpenWebUI (or another MCP client) to the MCPO endpoint through your
-   reverse proxy (example hostnames shown):
+4. Connect OpenWebUI (or another MCP client) to the MCPO endpoint:
    ```
-   https://mcpo.choype.com/mcp
+   http://<host>:3880/mcp
    ```
-7. Register the pipeline endpoint in OpenWebUI **Settings → Pipelines**:
-   * Base URL: `http://pipelines:9099` (or `https://pipelines.<your-domain>` if proxied)
+5. Register the pipeline endpoint in OpenWebUI **Settings → Pipelines**:
+   * Base URL: `http://pipelines:9099`
    * Pipeline: `web_navigator`
-8. Access generated screenshots or other exports via the viewer domain:
+6. Access generated screenshots or other exports via the viewer:
    ```
-   https://shots.choype.com/<file>.png
+   http://<host>:3888/<file>.png
    ```
 
 ### How MCPO is configured
@@ -117,69 +101,16 @@ The compose file honors the following environment variables:
 | `OPENAI_API_BASE` | Base URL for the LLM endpoint. | `https://api.openai.com/v1` |
 | `OPENAI_MODEL` | Model identifier passed to the Pipelines runtime. | `gpt-4o-mini` |
 | `PIPELINES_PATH` | Host directory mounted into `/app/pipelines` inside the Pipelines container. | `./pipelines` |
-| `PUBLIC_URL_BASE` | Base URL advertised by the `/tool/public_file` endpoint. | `https://shots.choype.com/public` |
-| `MCPO_DOMAIN` | Hostname that Caddy should route to the MCPO hub. | `mcpo.localhost` |
-| `SHOTS_DOMAIN` | Hostname that Caddy should route to the screenshot viewer. | `shots.localhost` |
-| `PIPELINES_DOMAIN` | Hostname that Caddy should route to the pipelines API. | `pipelines.localhost` |
-| `MCPO_BASE_URL` | MCPO URL (including the server slug, e.g. `/mcp_playwright`) used by the `web_navigator` pipeline. | `http://mcpo:3879/mcp_playwright` |
-| `MCPO_HOST_BIND` | Host bind address for the MCPO container port. | `127.0.0.1:3880` |
-| `PIPELINES_HOST_BIND` | Host bind address for the pipelines service. | `127.0.0.1:9099` |
-| `SHOTS_HOST_BIND` | Host bind address for the screenshot viewer. | `127.0.0.1:3888` |
-| `CADDY_ACME_EMAIL` | Email address used by Caddy when requesting Let's Encrypt certificates. | `admin@example.com` |
-
-The MCPO hub exposes each upstream tool on its own path under the same domain.
-For example `https://mcpo.choype.com/mcp_playwright` reaches the Playwright MCP
-server while `https://mcpo.choype.com/mcp_tars` targets the UI-TARS MCP. Set
-`MCPO_BASE_URL` to the specific path you want the `web_navigator` pipeline to
-call; the pipeline will append `/v1/...` to that base when issuing requests.
-
-The MCPO container writes a randomly generated tool API key to
-`./mcpo/tool_api_key` the first time it launches. Provide the same key via the
-`X-API-Key` header when calling the `/tool/public_file` endpoint from external
-clients. To supply your own value, set `TOOL_API_KEY` before running
-`docker compose up`.
 
 ## Networking and proxy readiness
 
-All services communicate over a shared Docker bridge network (`mcpnet`). The MCPO hub, Pipelines API, and screenshot viewer now bind to the loopback interface on the host to prevent unsolicited public access. The bundled Caddy service terminates TLS and publishes the domains (`mcpo.choype.com`, `shots.choype.com`, `pipelines.choype.com`). If you prefer a different proxy, disable the Caddy service and route traffic to the loopback-bound ports yourself.
-
-### Bundled Caddy reverse proxy
-
-The stack now ships with a dedicated [Caddy](https://caddyserver.com/) service that
-terminates TLS, issues certificates via Let's Encrypt, and proxies each public
-hostname to the appropriate internal container. The default
-[`caddy/Caddyfile`](./caddy/Caddyfile) expects the domain names provided in `.env`:
-
-```caddyfile
-{$MCPO_DOMAIN} {
-  reverse_proxy mcpo:3879
-}
-
-{$SHOTS_DOMAIN} {
-  reverse_proxy screenshot-viewer:80
-}
-
-{$PIPELINES_DOMAIN} {
-  reverse_proxy pipelines:9099
-}
-```
-
-Update the domain variables to match your DNS records. If you expose multiple
-MCPO tools, add additional `reverse_proxy` blocks that point to the same MCPO
-container port (`mcpo:3879`) and let MCPO route requests based on the path
-(`mcp_playwright`, `mcp_tars`, etc.). When using custom TLS certificates instead of
-Let's Encrypt, replace the automatic certificate issuance with a
-[`tls`](https://caddyserver.com/docs/caddyfile/directives/tls) directive inside each
-site block. Set `CADDY_ACME_EMAIL` in `.env` to an address you control so Let's
-Encrypt renewal notices reach you.
+All services communicate over a shared Docker bridge network (`mcpnet`). Only the MCPO hub, Pipelines API, and screenshot viewer expose ports on the host. This stack is proxy-ready (Traefik planned for `*.choype.com`) so it can be fronted by a reverse proxy without restructuring the containers.
 
 ## Repository layout
 
 ```
 webui-mcp-stack/
 ├── compose.yml
-├── caddy/
-│   └── Caddyfile
 ├── mcpo/
 │   ├── config.json
 │   ├── launch_mcpo.py
