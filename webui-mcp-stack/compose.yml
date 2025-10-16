@@ -5,6 +5,25 @@ networks:
     name: mcpnet
 
 services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: mcpo-caddy
+    restart: unless-stopped
+    environment:
+      - MCPO_DOMAIN=${MCPO_DOMAIN:-mcpo.localhost}
+      - SHOTS_DOMAIN=${SHOTS_DOMAIN:-shots.localhost}
+      - PIPELINES_DOMAIN=${PIPELINES_DOMAIN:-pipelines.localhost}
+      - CADDY_ACME_EMAIL=${CADDY_ACME_EMAIL:-admin@example.com}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - mcpnet
+
   playwright-mcp:
     image: mcr.microsoft.com/playwright/mcp:latest
     container_name: playwright-mcp
@@ -85,8 +104,12 @@ services:
         chown -R 10042:10042 /tmp/playwright-output &&
         chmod -R 777 /tmp/playwright-output &&
         exec mcpo --config /config/config.json --host 0.0.0.0 --port 3879
+    environment:
+      - PUBLIC_URL_BASE=${PUBLIC_URL_BASE:-https://shots.choype.com/public}
+      - TOOL_API_KEY=${TOOL_API_KEY:-}
+      - TOOL_API_KEY_FILE=${TOOL_API_KEY_FILE:-/config/tool_api_key}
     ports:
-      - "3880:3879"
+      - "${MCPO_HOST_BIND:-127.0.0.1:3880}:3879"
     networks:
       - mcpnet
     restart: unless-stopped
@@ -101,10 +124,11 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - OPENAI_API_BASE=${OPENAI_API_BASE:-https://api.openai.com/v1}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - MCPO_BASE_URL=${MCPO_BASE_URL:-http://mcpo:3879/mcp_playwright}
     volumes:
       - ${PIPELINES_PATH:-./pipelines}:/app/pipelines
     ports:
-      - "9099:9099"
+      - "${PIPELINES_HOST_BIND:-127.0.0.1:9099}:9099"
     networks:
       - mcpnet
 
@@ -116,7 +140,11 @@ services:
     volumes:
       - ./exports:/usr/share/nginx/html:ro
     ports:
-      - "3888:80"
+      - "${SHOTS_HOST_BIND:-127.0.0.1:3888}:80"
     networks:
       - mcpnet
     restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
