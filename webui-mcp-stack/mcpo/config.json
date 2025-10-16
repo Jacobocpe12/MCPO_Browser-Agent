@@ -7,6 +7,10 @@
     "mcp_tars": {
       "type": "streamable-http",
       "url": "http://ui-tars-mcp:8000/mcp"
+    },
+    "mcp_vision_fusion": {
+      "type": "streamable-http",
+      "url": "http://vision-fusion-mcp:8500/mcp"
     }
   }
 }

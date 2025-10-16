@@ -51,7 +51,20 @@ services:
     networks:
       - mcpnet
     restart: unless-stopped
-    
+
+  vision-fusion-mcp:
+    build:
+      context: ./vision-fusion-mcp
+    image: vision-fusion-mcp:latest
+    container_name: vision-fusion-mcp
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - /srv/exports:/exports:ro
+    networks:
+      - mcpnet
+    restart: unless-stopped
+
   mcpo:
     build:
       context: ./mcpo
@@ -60,6 +73,7 @@ services:
     depends_on:
       - playwright-mcp
       - ui-tars-mcp
+      - vision-fusion-mcp
     volumes:
       - ./mcpo:/config
     entrypoint: ["/bin/sh", "-c"]
@@ -76,6 +90,10 @@ services:
               "mcp_tars": {
                 "type": "streamable-http",
                 "url": "http://ui-tars-mcp:8000/mcp"
+              },
+              "mcp_vision_fusion": {
+                "type": "streamable-http",
+                "url": "http://vision-fusion-mcp:8500/mcp"
               }
             }
           }' > /config/config.json;

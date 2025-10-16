@@ -9,7 +9,8 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
 | ------- | ------- |
 | **Playwright MCP** | Provides browser automation with Playwright. Configured with vision, PDF, and install capabilities, and writes artifacts to the shared `exports/` folder. |
 | **UI-TARS MCP** | Node-based vision and interaction MCP server that leverages Google Chrome for UI automation. |
-| **MCPO Hub** | Aggregates the two MCP servers and exposes a single endpoint for OpenWebUI or other MCP-compatible clients. |
+| **Vision Fusion MCP** | Fast OCR + GPT-4o vision fusion service that reads images from `/exports`, returning combined `ocr_text` and `vision_analysis` JSON fields. |
+| **MCPO Hub** | Aggregates the MCP servers and exposes a single endpoint for OpenWebUI or other MCP-compatible clients. |
 | **OpenWebUI Pipelines** | Hosts custom pipelines—including `web_navigator`—and exposes them to OpenWebUI over HTTP. |
 | **Screenshot Viewer** | Serves files from the shared `exports/` directory via HTTP so captured images can be accessed in a browser. |
 
@@ -52,7 +53,7 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
 
 ### How MCPO is configured
 
-The MCPO container now runs in **config-only** mode so it can attach to the already running Playwright and TARS MCP servers without extra CLI flags. The bundled [`mcpo/config.json`](./mcpo/config.json) uses the required hyphenated `streamable-http` type and advertises both endpoints:
+The MCPO container now runs in **config-only** mode so it can attach to the already running Playwright, TARS, and Vision Fusion MCP servers without extra CLI flags. The bundled [`mcpo/config.json`](./mcpo/config.json) uses the required hyphenated `streamable-http` type and advertises all endpoints:
 
 ```json
 {
@@ -64,6 +65,10 @@ The MCPO container now runs in **config-only** mode so it can attach to the alre
     "mcp_tars": {
       "type": "streamable-http",
       "url": "http://ui-tars-mcp:8000/mcp"
+    },
+    "mcp_vision_fusion": {
+      "type": "streamable-http",
+      "url": "http://vision-fusion-mcp:8500/mcp"
     }
   }
 }
@@ -76,6 +81,12 @@ mcpo --config /config/config.json --host 0.0.0.0 --port 3879
 ```
 
 This avoids the `TypeError: 'NoneType' object is not subscriptable` crash that occurred when mixing `--server-type` CLI arguments with the JSON configuration.
+
+### Vision Fusion MCP service
+
+The [`vision-fusion-mcp`](./vision-fusion-mcp) directory contains a lightweight Flask service that performs OCR (English and German via Tesseract) before calling GPT-4o for multimodal reasoning. It exposes a single `analyze_image` tool that returns JSON with `ocr_text` and `vision_analysis` fields. Include this MCP in OpenWebUI using the `mcp_vision_fusion` entry added to `config.json`.
+
+For orchestrators that rely on Codex-style prompts, the recommended system message is stored in [`vision-fusion-mcp/CODEX_PROMPT.md`](./vision-fusion-mcp/CODEX_PROMPT.md).
 
 ### Adding the `web_navigator` pipeline
 
