@@ -17,7 +17,7 @@ RUN git clone "$PLAYWRIGHT_VISION_REPO" . \
     && npm prune --omit=dev \
     && rm -rf .git
 
-FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+FROM mcr.microsoft.com/playwright:v1.56.1-jammy
 
 WORKDIR /app
 
