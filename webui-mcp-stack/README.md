@@ -123,6 +123,9 @@ The compose file honors the following environment variables:
 | `OPENAI_API_BASE` | Base URL for the LLM endpoint. | `https://api.openai.com/v1` |
 | `OPENAI_MODEL` | Model identifier passed to the Pipelines runtime. | `gpt-4o-mini` |
 | `PIPELINES_PATH` | Host directory mounted into `/app/pipelines` inside the Pipelines container. | `./pipelines` |
+| `LANGFLOW_SUPERUSER` | Email or username created on first boot for the Langflow UI. | `admin` |
+| `LANGFLOW_SUPERUSER_PASSWORD` | Password for the Langflow superuser account. Change this before exposing Langflow publicly. | `changeme` |
+| `LANGFLOW_DATABASE_URL` | Database connection string used by Langflow. Defaults to a SQLite database stored in the mounted volume. | `sqlite:////app/langflow/langflow.db` |
 
 ## Networking and proxy readiness
 
