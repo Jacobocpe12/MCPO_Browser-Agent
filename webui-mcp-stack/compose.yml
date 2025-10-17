@@ -147,6 +147,7 @@ services:
   langflow:
     image: langflowai/langflow:latest
     container_name: langflow
+    user: "0:0"
     environment:
       - LANGFLOW_SUPERUSER=${LANGFLOW_SUPERUSER:-admin}
       - LANGFLOW_SUPERUSER_PASSWORD=${LANGFLOW_SUPERUSER_PASSWORD:-changeme}
