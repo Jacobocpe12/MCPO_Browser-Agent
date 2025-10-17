@@ -143,3 +143,11 @@ services:
     networks:
       - mcpnet
     restart: unless-stopped
+
+  langflow:
+    image: langflowai/langflow:latest
+    ports:
+      - "7860:7860"
+    networks:
+      - mcpnet
+    restart: unless-stopped
