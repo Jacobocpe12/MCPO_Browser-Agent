@@ -147,14 +147,18 @@ services:
   langflow:
     image: langflowai/langflow:latest
     container_name: langflow
+    user: "0:0"
     environment:
       - LANGFLOW_SUPERUSER=${LANGFLOW_SUPERUSER:-admin}
       - LANGFLOW_SUPERUSER_PASSWORD=${LANGFLOW_SUPERUSER_PASSWORD:-changeme}
       - LANGFLOW_DATABASE_URL=${LANGFLOW_DATABASE_URL:-sqlite:////app/langflow/langflow.db}
     volumes:
-      - ./langflow-data:/app/langflow
+      - langflow-data:/app/langflow
     ports:
       - "7860:7860"
     networks:
       - mcpnet
     restart: unless-stopped
+
+volumes:
+  langflow-data:
