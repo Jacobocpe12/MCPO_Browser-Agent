@@ -13,7 +13,7 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
 | **MCPO Hub** | Aggregates the MCP servers and exposes a single endpoint for OpenWebUI or other MCP-compatible clients. |
 | **OpenWebUI Pipelines** | Hosts custom pipelines—including `web_navigator`—and exposes them to OpenWebUI over HTTP. |
 | **Screenshot Viewer** | Serves files from the shared `exports/` directory via HTTP so captured images can be accessed in a browser. |
-| **Langflow** | Provides a drag-and-drop interface for composing agent and workflow graphs. Useful for prototyping flows that call the MCP services. |
+| **Langflow** | Provides a drag-and-drop interface for composing agent and workflow graphs. Runs with Langflow's upstream defaults and listens on port `7860`. |
 
 ## Prerequisites
 
@@ -51,7 +51,7 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
    ```
    http://<host>:3888/<file>.png
    ```
-7. Open the Langflow builder UI to create or import projects:
+7. Open the Langflow builder UI to create or import projects (uses the default Langflow credentials on first launch):
    ```
    http://<host>:7860/
    ```
