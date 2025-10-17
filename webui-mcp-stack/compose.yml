@@ -52,15 +52,17 @@ services:
       - mcpnet
     restart: unless-stopped
 
-  vision-fusion-mcp:
+  playwright-vision-mcp:
     build:
-      context: ./vision-fusion-mcp
-    image: vision-fusion-mcp:latest
-    container_name: vision-fusion-mcp
+      context: ./playwright-vision-mcp
+    image: playwright-vision-mcp:latest
+    container_name: playwright-vision-mcp
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PORT=8500
+      - SCREENSHOT_DIR=/exports/screenshots
     volumes:
-      - /srv/exports:/exports:ro
+      - /srv/exports:/exports:rw
     networks:
       - mcpnet
     restart: unless-stopped
@@ -73,7 +75,7 @@ services:
     depends_on:
       - playwright-mcp
       - ui-tars-mcp
-      - vision-fusion-mcp
+      - playwright-vision-mcp
     volumes:
       - ./mcpo:/config
       - /srv/exports:/exports:ro
@@ -94,9 +96,9 @@ services:
                 "type": "streamable-http",
                 "url": "http://ui-tars-mcp:8000/mcp"
               },
-              "mcp_vision_fusion": {
+              "mcp_playwright_vision": {
                 "type": "streamable-http",
-                "url": "http://vision-fusion-mcp:8500/mcp"
+                "url": "http://playwright-vision-mcp:8500/mcp"
               }
             }
           }' > /config/config.json;
