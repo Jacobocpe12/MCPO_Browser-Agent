@@ -13,6 +13,7 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
 | **MCPO Hub** | Aggregates the MCP servers and exposes a single endpoint for OpenWebUI or other MCP-compatible clients. |
 | **OpenWebUI Pipelines** | Hosts custom pipelines—including `web_navigator`—and exposes them to OpenWebUI over HTTP. |
 | **Screenshot Viewer** | Serves files from the shared `exports/` directory via HTTP so captured images can be accessed in a browser. |
+| **Langflow** | Provides a drag-and-drop interface for composing agent and workflow graphs. Useful for prototyping flows that call the MCP services. |
 
 ## Prerequisites
 
@@ -49,6 +50,10 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
 6. Access generated screenshots or other exports via the viewer:
    ```
    http://<host>:3888/<file>.png
+   ```
+7. Open the Langflow builder UI to create or import projects:
+   ```
+   http://<host>:7860/
    ```
 
 ### How MCPO is configured
@@ -118,6 +123,9 @@ The compose file honors the following environment variables:
 | `OPENAI_API_BASE` | Base URL for the LLM endpoint. | `https://api.openai.com/v1` |
 | `OPENAI_MODEL` | Model identifier passed to the Pipelines runtime. | `gpt-4o-mini` |
 | `PIPELINES_PATH` | Host directory mounted into `/app/pipelines` inside the Pipelines container. | `./pipelines` |
+| `LANGFLOW_SUPERUSER` | Email or username created on first boot for the Langflow UI. | `admin` |
+| `LANGFLOW_SUPERUSER_PASSWORD` | Password for the Langflow superuser account. Change this before exposing Langflow publicly. | `changeme` |
+| `LANGFLOW_DATABASE_URL` | Database connection string used by Langflow. Defaults to a SQLite database stored in the mounted volume. | `sqlite:////app/langflow/langflow.db` |
 
 ## Networking and proxy readiness
 
