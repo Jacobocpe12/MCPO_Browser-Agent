@@ -9,7 +9,7 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
 | ------- | ------- |
 | **Playwright MCP** | Provides browser automation with Playwright. Configured with vision, PDF, and install capabilities, and writes artifacts to the shared `exports/` folder. |
 | **UI-TARS MCP** | Node-based vision and interaction MCP server that leverages Google Chrome for UI automation. |
-| **Vision Fusion MCP** | Fast OCR + GPT-4o vision fusion service that reads images from `/exports`, returning combined `ocr_text` and `vision_analysis` JSON fields. |
+| **Playwright Vision MCP** | Adds browser automation, screenshot capture, and GPT-backed vision analysis via the `playwright-vision-mcp` service. Artifacts are written to the shared `exports/` folder. |
 | **MCPO Hub** | Aggregates the MCP servers and exposes a single endpoint for OpenWebUI or other MCP-compatible clients. |
 | **OpenWebUI Pipelines** | Hosts custom pipelines—including `web_navigator`—and exposes them to OpenWebUI over HTTP. |
 | **Screenshot Viewer** | Serves files from the shared `exports/` directory via HTTP so captured images can be accessed in a browser. |
@@ -53,7 +53,7 @@ A Docker Compose stack that bundles two Model Context Protocol (MCP) servers wit
 
 ### How MCPO is configured
 
-The MCPO container now runs in **config-only** mode so it can attach to the already running Playwright, TARS, and Vision Fusion MCP servers without extra CLI flags. The bundled [`mcpo/config.json`](./mcpo/config.json) uses the required hyphenated `streamable-http` type and advertises all endpoints:
+The MCPO container now runs in **config-only** mode so it can attach to the already running Playwright, TARS, and Playwright Vision MCP servers without extra CLI flags. The bundled [`mcpo/config.json`](./mcpo/config.json) uses the required hyphenated `streamable-http` type and advertises all endpoints:
 
 ```json
 {
@@ -66,9 +66,9 @@ The MCPO container now runs in **config-only** mode so it can attach to the alre
       "type": "streamable-http",
       "url": "http://ui-tars-mcp:8000/mcp"
     },
-    "mcp_vision_fusion": {
+    "mcp_playwright_vision": {
       "type": "streamable-http",
-      "url": "http://vision-fusion-mcp:8500/mcp"
+      "url": "http://playwright-vision-mcp:8500/mcp"
     }
   }
 }
@@ -82,11 +82,17 @@ mcpo --config /config/config.json --host 0.0.0.0 --port 3879
 
 This avoids the `TypeError: 'NoneType' object is not subscriptable` crash that occurred when mixing `--server-type` CLI arguments with the JSON configuration.
 
-### Vision Fusion MCP service
+### Playwright Vision MCP service
 
-The [`vision-fusion-mcp`](./vision-fusion-mcp) directory contains a lightweight Flask service that performs OCR (English and German via Tesseract) before calling GPT-4o for multimodal reasoning. It exposes a single `analyze_image` tool that returns JSON with `ocr_text` and `vision_analysis` fields. Include this MCP in OpenWebUI using the `mcp_vision_fusion` entry added to `config.json`.
+The [`playwright-vision-mcp`](./playwright-vision-mcp) directory contains a Dockerfile that builds the upstream [playwright-vision-mcp](https://github.com/davidkim9/playwright-vision-mcp) project directly from Git. This keeps the stack lightweight—no vendored source tree—while still exposing the full tool suite that combines Playwright-driven browser automation with GPT-powered vision analysis and image interpretation. Override the `PLAYWRIGHT_VISION_REPO` or `PLAYWRIGHT_VISION_REF` build arguments in `docker compose build` to point at a fork or different commit.
 
-For orchestrators that rely on Codex-style prompts, the recommended system message is stored in [`vision-fusion-mcp/CODEX_PROMPT.md`](./vision-fusion-mcp/CODEX_PROMPT.md).
+Key defaults applied by the Dockerfile and compose definition:
+
+* Runs in headless mode on port `8500`.
+* Persists screenshots to the shared `/exports/screenshots` directory so the screenshot viewer and other services can read them.
+* Uses Chromium by default, with overrides available through the `BROWSER_TYPE` environment variable.
+
+Expose the MCP through OpenWebUI using the `mcp_playwright_vision` entry emitted into `config.json`.
 
 ### Adding the `web_navigator` pipeline
 
@@ -122,6 +128,9 @@ All services communicate over a shared Docker bridge network (`mcpnet`). Only th
 ```
 webui-mcp-stack/
 ├── compose.yml
+├── playwright-vision-mcp/
+│   ├── Dockerfile
+│   └── README.md
 ├── mcpo/
 │   ├── config.json
 │   ├── launch_mcpo.py
