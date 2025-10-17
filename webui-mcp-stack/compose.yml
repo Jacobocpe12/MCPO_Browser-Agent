@@ -58,7 +58,7 @@ services:
     image: playwright-vision-mcp:latest
     container_name: playwright-vision-mcp
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_KEY=${api_key}
       - PORT=8500
       - SCREENSHOT_DIR=/exports/screenshots
     volumes:
